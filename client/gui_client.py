@@ -1,0 +1,964 @@
+"""
+ORION Executive Dashboard — gui_client.py
+=========================================
+Solidified client with:
+  • Sarvam AI TTS (Simrun voice) with 3-key rotation
+  • Portable face-encoding path (data/encoded_file.p)
+  • Clean, premium HUD with live status feedback
+  • Sentence-split streaming for low-latency speech
+"""
+
+import sys, os, cv2, time, threading, requests, queue, psutil, pickle, json
+import numpy as np, face_recognition, pyttsx3, speech_recognition as sr
+import pygame, tempfile, re, base64
+
+from datetime import datetime
+from dotenv import load_dotenv
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
+    QHBoxLayout, QLabel, QTextEdit, QFrame, QProgressBar,
+    QGraphicsDropShadowEffect, QLineEdit
+)
+from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap, QFont, QColor
+
+# ─────────────────────────────────────────────
+# 1. CONFIGURATION
+# ─────────────────────────────────────────────
+# Load .env from project root (one level up from /client)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+
+API_URL = os.environ.get("ORION_API_URL", "http://localhost:8000")
+ENCODINGS_FILE = os.path.join(PROJECT_ROOT, "data", "encoded_file.p")
+# Pull from env if exists, else match the higher tolerance recommended for webcam
+MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", 0.55))
+
+
+def parse_env_list(key):
+    """Parse a JSON-style list from an environment variable."""
+    raw = os.environ.get(key, "")
+    if not raw:
+        return []
+    try:
+        return json.loads(raw.replace("'", '"'))
+    except Exception:
+        return [raw] if raw else []
+
+SARVAM_API_KEYS = parse_env_list("SARVAM_API_KEYS")
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+print(f"[INIT] Loaded {len(SARVAM_API_KEYS)} Sarvam keys and ElevenLabs support")
+
+# Speaker Card selection (Pi-Specific mainly)
+SPEAKER_CARD_INDEX = os.environ.get("SPEAKER_CARD_INDEX", None)
+if SPEAKER_CARD_INDEX and os.name == 'posix':
+    # On Linux, SDL_AUDIODEV is the standard for selecting a specific card
+    os.environ["SDL_AUDIODEV"] = f"plughw:{SPEAKER_CARD_INDEX},0"
+
+# Initialise PyGame Mixer
+try:
+    pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
+except Exception as e:
+    print(f"[AUDIO INIT ERR] {e}")
+
+PRIORITY_RESPONSE = 1
+PRIORITY_ALERT    = 2
+PRIORITY_IDLE     = 3
+
+def split_sentences(text):
+    """Split text into sentences for faster TTS streaming."""
+    return [s.strip() for s in re.split(r'(?<=[.!?\n]) +', text) if s.strip()]
+
+
+# ─────────────────────────────────────────────
+# 2. THREADS
+# ─────────────────────────────────────────────
+
+class VoiceThread(QThread):
+    """Microphone listener — emits recognised text."""
+    heard_text     = pyqtSignal(str)
+    status_changed = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.recognizer = sr.Recognizer()
+        
+        # Robust Mic selection: Use .env (MIC_INDEX) or default to None
+        mic_idx = os.environ.get("MIC_INDEX")
+        try:
+            mic_idx = int(mic_idx) if mic_idx is not None else None
+        except:
+            mic_idx = None
+            
+        print(f"[ORION] Initialising microphone on index: {mic_idx if mic_idx is not None else 'Default'}")
+        self.mic = sr.Microphone(device_index=mic_idx)
+        self.running = True
+
+    def run(self):
+        try:
+            with self.mic as source:
+                print("[ORION] Calibrating microphone …")
+                self.recognizer.adjust_for_ambient_noise(source, duration=1)
+                print("[ORION] Microphone ready.")
+                while self.running:
+                    try:
+                        self.status_changed.emit("LISTENING")
+                        audio = self.recognizer.listen(source, timeout=2, phrase_time_limit=10)
+                        self.status_changed.emit("PROCESSING")
+                        text = self.recognizer.recognize_google(audio)
+                        if text:
+                            print(f"[HEARD] {text}")
+                            self.heard_text.emit(text)
+                    except sr.WaitTimeoutError:
+                        pass
+                    except sr.UnknownValueError:
+                        pass
+                    except Exception as e:
+                        print(f"[MIC ERR] {e}")
+                    finally:
+                        self.status_changed.emit("IDLE")
+        except Exception as e:
+            print(f"[MIC CRITICAL ERR] Could not access microphone: {e}")
+            self.status_changed.emit("MIC_ERROR")
+            # Ensure the thread stays alive or exits gracefully
+            time.sleep(5)
+
+
+class SpeakerThread(QThread):
+    """TTS engine — Sarvam AI with key rotation, pyttsx3 fallback."""
+    status_changed = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        # Offline fallback
+        self.offline_engine = pyttsx3.init()
+        self.offline_engine.setProperty('rate', 165)
+        
+        # Try to find a better offline voice (like Zira or Hazel)
+        voices = self.offline_engine.getProperty('voices')
+        if len(voices) > 1:
+            for v in voices:
+                if "Zira" in v.name or "Hazel" in v.name or "Female" in v.name:
+                    self.offline_engine.setProperty('voice', v.id)
+                    break
+
+        # Sarvam rotation state
+        self.sarvam_keys  = SARVAM_API_KEYS
+        self.sarvam_index = 0
+        self._init_sarvam()
+        
+        # ElevenLabs init
+        self.eleven_api_key = ELEVENLABS_API_KEY
+        self.eleven_voice_id = ELEVENLABS_VOICE_ID
+
+        self.queue   = queue.PriorityQueue()
+        self.running = True
+
+    # ── Sarvam helpers ──
+    def _init_sarvam(self):
+        if self.sarvam_keys:
+            try:
+                from sarvamai import SarvamAI
+                self.sarvam_client = SarvamAI(api_subscription_key=self.sarvam_keys[self.sarvam_index])
+                print(f"[TTS] Sarvam client initialised (Key #{self.sarvam_index})")
+            except Exception as e:
+                print(f"[TTS] Sarvam init error: {e}")
+                self.sarvam_client = None
+        else:
+            self.sarvam_client = None
+
+    def _rotate_sarvam(self):
+        if not self.sarvam_keys:
+            return
+        self.sarvam_index = (self.sarvam_index + 1) % len(self.sarvam_keys)
+        print(f"[TTS] Rotating → Sarvam Key #{self.sarvam_index}")
+        self._init_sarvam()
+
+    # ── Playback ──
+    def _play_audio(self, audio_bytes):
+        """Write audio bytes to a temp .wav file and play through pygame."""
+        suffix = ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as fp:
+            fp.write(audio_bytes)
+            temp_path = fp.name
+
+        try:
+            pygame.mixer.music.load(temp_path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.05)
+            pygame.mixer.music.unload()
+        except Exception as e:
+            print(f"[PLAY ERR] {e}")
+        finally:
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+
+    # ── Public API ──
+    def say(self, text, priority=PRIORITY_RESPONSE):
+        """Queue text for TTS. Filters out SYSTEM updates from being spoken."""
+        if text.startswith("SYSTEM"):
+            # Put system notifications into the alerts box or log, but skip voice
+            print(f"[UI LOG] {text}")
+            return
+
+        self.queue.put((priority, text))
+
+    # ── Main loop ──
+    def run(self):
+        while self.running:
+            try:
+                priority, full_text = self.queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            # Split long text for faster first-word
+            sentences = split_sentences(full_text) if len(full_text) > 100 else [full_text]
+
+            for sentence in sentences:
+                if not self.running:
+                    break
+
+                self.status_changed.emit("SPEAKING")
+                
+                # Language detection: simple check for Hindi/Devanagari characters
+                is_hindi = any('\u0900' <= char <= '\u097F' for char in sentence)
+                
+                spoken = False
+                if not is_hindi and self.eleven_api_key:
+                    # English text -> ElevenLabs first
+                    spoken = self._speak_elevenlabs(sentence)
+                
+                if not spoken:
+                    # Hindi text or ElevenLabs failure -> Sarvam (priya voice)
+                    spoken = self._speak_sarvam(sentence)
+                
+                if not spoken:
+                    self._speak_offline(sentence)
+
+                time.sleep(0.08)  # natural pause
+
+            self.status_changed.emit("IDLE")
+            self.queue.task_done()
+
+    def _speak_sarvam(self, text) -> bool:
+        """Attempt Sarvam TTS with key rotation. Returns True on success."""
+        if not self.sarvam_client:
+            return False
+
+        retries = 0
+        max_retries = len(self.sarvam_keys) if self.sarvam_keys else 1
+
+        while retries < max_retries:
+            try:
+                print(f"[TTS] Sarvam Key #{self.sarvam_index} → priya voice")
+                response = self.sarvam_client.text_to_speech.convert(
+                    text=text,
+                    target_language_code="en-IN",
+                    speaker="priya",
+                    model="bulbul:v2" # v2 is much higher quality (human-like)
+                )
+
+                # Handle response — SDK returns object with audios list (base64 wav)
+                audio_bytes = None
+                if hasattr(response, 'audios') and response.audios:
+                    audio_bytes = base64.b64decode(response.audios[0])
+                elif isinstance(response, dict) and 'audios' in response:
+                    audio_bytes = base64.b64decode(response['audios'][0])
+
+                if audio_bytes and len(audio_bytes) > 100:
+                    print(f"[TTS] Got {len(audio_bytes)} bytes. Playing …")
+                    self._play_audio(audio_bytes)
+                    return True
+                else:
+                    print(f"[TTS] Empty audio from Sarvam. Response: {type(response)}")
+                    self._rotate_sarvam()
+                    retries += 1
+
+            except Exception as e:
+                print(f"[TTS ERR] Key #{self.sarvam_index} failed: {e}")
+                
+                # Rotate on ANY error during the retry phase to ensure we find a working key
+                self._rotate_sarvam()
+                retries += 1
+                time.sleep(1) # Brief pause before retry
+        return False
+
+    def _speak_elevenlabs(self, text) -> bool:
+        """Attempt ElevenLabs TTS. Returns True on success."""
+        if not self.eleven_api_key:
+            return False
+        
+        try:
+            print(f"[TTS] ElevenLabs → {self.eleven_voice_id}")
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.eleven_voice_id}"
+            headers = {
+                "Accept": "audio/mpeg",
+                "Content-Type": "application/json",
+                "xi-api-key": self.eleven_api_key
+            }
+            data = {
+                "text": text,
+                "model_id": "eleven_monolingual_v1",
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.5
+                }
+            }
+            response = requests.post(url, json=data, headers=headers)
+            if response.status_code == 200:
+                self._play_audio(response.content)
+                return True
+            else:
+                print(f"[TTS ERR] ElevenLabs status {response.status_code}: {response.text}")
+                return False
+        except Exception as e:
+            print(f"[TTS ERR] ElevenLabs failed: {e}")
+            return False
+
+    def _speak_offline(self, text):
+        """pyttsx3 fallback for when no API keys work."""
+        print("[TTS] Falling back to offline voice.")
+        try:
+            self.offline_engine.say(text)
+            self.offline_engine.runAndWait()
+        except Exception as e:
+            print(f"[OFFLINE ERR] {e}")
+
+
+class BackendThread(QThread):
+    """Sends user message to backend /chat and returns response."""
+    response_received = pyqtSignal(str)
+    error_occurred    = pyqtSignal(str)
+
+    def __init__(self, message, user_id):
+        super().__init__()
+        self.message = message
+        self.user_id = user_id
+
+    def run(self):
+        try:
+            payload = {"user_id": self.user_id, "message": self.message}
+            # Unified timeout: 5s for connect, 30s for response
+            res = requests.post(f"{API_URL}/chat", json=payload, timeout=(5, 30))
+            if res.status_code == 200:
+                self.response_received.emit(res.json().get("response", ""))
+            else:
+                self.error_occurred.emit(f"Server Error {res.status_code}")
+        except Exception as e:
+            self.error_occurred.emit(f"Offline: {str(e)}")
+        finally:
+            # Ensure the UI thread doesn't stay in 'THINKING' forever
+            self.msleep(100) # Small breathing room
+
+
+class NotificationThread(QThread):
+    """Polls /notifications every few seconds."""
+    new_notification = pyqtSignal(str)
+
+    def __init__(self, user_id):
+        super().__init__()
+        self.user_id = user_id
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                res = requests.get(
+                    f"{API_URL}/notifications",
+                    params={"user_id": self.user_id},
+                    timeout=3
+                )
+                if res.status_code == 200:
+                    for alert in res.json().get("notifications", []):
+                        self.new_notification.emit(alert)
+            except:
+                pass
+            time.sleep(5)
+
+
+class LogTailThread(QThread):
+    """Tails the orion.log file and emits new lines in real-time."""
+    new_log_line = pyqtSignal(str)
+
+    def __init__(self, log_path):
+        super().__init__()
+        self.log_path = log_path
+        self.running = True
+
+    def run(self):
+        # Wait for file to exist
+        while not os.path.exists(self.log_path) and self.running:
+            time.sleep(1)
+            
+        try:
+            with open(self.log_path, "r", encoding="utf-8", errors="ignore") as f:
+                f.seek(0, 2)
+                last_pos = f.tell()
+                
+                while self.running:
+                    # Check for rotation: if file size < last_pos, it was rotated
+                    if os.path.exists(self.log_path) and os.path.getsize(self.log_path) < last_pos:
+                        print(f"[LOG] File {self.log_path} rotated. Re-opening.")
+                        f.close()
+                        f = open(self.log_path, "r", encoding="utf-8", errors="ignore")
+                        last_pos = 0 # Start from beginning of new file
+                    
+                    line = f.readline()
+                    if not line:
+                        time.sleep(0.5)
+                        last_pos = f.tell() # Update pos even if no line to track shrinkage
+                        continue
+                    
+                    # Cleaning logs (ANSI codes, prefixes)
+                    clean_line = re.sub(r'\u001b\[.*?[mK]', '', line).strip()
+                    if clean_line:
+                        self.new_log_line.emit(clean_line)
+                    last_pos = f.tell()
+        except Exception as e:
+            print(f"[LOG TAIL ERR] {e}")
+
+
+class FaceRecognitionThread(QThread):
+    """Offloads heavy face detection/encoding to avoid UI stuttering."""
+    faces_detected = pyqtSignal(list, list) # (locations, names)
+
+    def __init__(self, encodings, names):
+        super().__init__()
+        self.known_encodings = encodings
+        self.known_names = names
+        self.frame_queue = queue.Queue(maxsize=1)
+        self.running = True
+        # Allow choosing between 'hog' (fast/Pi) and 'cnn' (accurate/PC)
+        self.model = os.environ.get("FACE_MODEL", "hog")
+
+    def process_frame(self, frame):
+        if self.frame_queue.full():
+            try: self.frame_queue.get_nowait()
+            except: pass
+        self.frame_queue.put(frame)
+
+    def run(self):
+        print(f"[FACE] Thread started using model: {self.model}")
+        while self.running:
+            try:
+                frame = self.frame_queue.get(timeout=0.5)
+                # Double resize for high accuracy (0.5x instead of 0.25x)
+                small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                
+                # OPTIONAL: Enhance contrast on live frame to match training
+                gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+                clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))
+                enhanced_gray = clahe.apply(gray)
+                rgb_enhanced = cv2.merge([enhanced_gray, enhanced_gray, enhanced_gray])
+
+                # Detect / Encode
+                # Use rgb_enhanced for detections as well for consistent results
+                locs = face_recognition.face_locations(rgb_enhanced, model=self.model)
+                # Use num_jitters=2 for live encoding to handle slight motion blur
+                encs = face_recognition.face_encodings(rgb_enhanced, locs, num_jitters=2)
+                
+                detected_names = []
+                for enc in encs:
+                    # Logic: Get distances to ALL known faces
+                    face_distances = face_recognition.face_distance(self.known_encodings, enc)
+                    
+                    name = "UNKNOWN"
+                    if len(face_distances) > 0:
+                        best_match_index = np.argmin(face_distances)
+                        # Check if the best match is actually below the threshold
+                        if face_distances[best_match_index] < MATCH_THRESHOLD:
+                             name = self.known_names[best_match_index]
+                    
+                    detected_names.append(name)
+                
+                self.faces_detected.emit(locs, detected_names)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[FACE ERR] {e}")
+
+
+# ─────────────────────────────────────────────
+# 3. MAIN DASHBOARD
+# ─────────────────────────────────────────────
+
+
+class OrionDashboard(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ORION Core")
+        self.setMinimumSize(1280, 800)
+
+        self.current_user  = "Unknown"
+        self.status        = "IDLE"
+        self.scan_line_y   = 0
+        self.pulse_dir     = 1
+        self.pulse_alpha   = 150
+        self.running       = True # Global UI thread flag
+        self.last_seen_time = time.time() # For user persistence
+        self.last_greeted_user = "Unknown"
+        self.last_greet_time   = 0
+
+        # Face Recognition
+        self.known_encodings = []
+        self.known_names     = []
+        self._load_encodings()
+
+        # UI
+        self._build_ui()
+        self._start_camera()
+        
+        self.backend_threads = [] # Refs for GC management
+
+        # Health link setup
+        self.server_online = False
+        self._health_timer = QTimer()
+        self._health_timer.timeout.connect(self._check_server_health)
+        self._health_timer.start(5000)
+
+        # Face Recognition Setup (Stabilized)
+        self.face_locs = []
+        self.face_names = []
+        self._name_buffer = [] # For stabilization
+        
+        self.face_thread = FaceRecognitionThread(self.known_encodings, self.known_names)
+        self.face_thread.faces_detected.connect(self._on_faces_found)
+        self.face_thread.start()
+
+        # Threads
+        try:
+            self.speaker = SpeakerThread()
+            self.speaker.status_changed.connect(self._on_status)
+            self.speaker.start()
+        except Exception as e:
+            print(f"[SPEAK ERR] {e}")
+
+        self.voice = None
+        try:
+            self.voice = VoiceThread()
+            self.voice.heard_text.connect(self._on_voice_input)
+            self.voice.status_changed.connect(self._on_status)
+            self.voice.start()
+        except Exception as e:
+            print(f"[VOICE INIT ERR] {e}")
+            self._on_status("VOICE_UNAVAILABLE")
+
+        self.notifier = NotificationThread(self.current_user)
+        self.notifier.new_notification.connect(self._on_notification)
+        self.notifier.start()
+
+        # Real-time Log Tailing
+        log_file = os.path.join(PROJECT_ROOT, "logs", "orion.log")
+        self.log_tailer = LogTailThread(log_file)
+        self.log_tailer.new_log_line.connect(self._on_new_log)
+        self.log_tailer.start()
+
+    # ── Face Encodings ──
+    def _load_encodings(self):
+        if not os.path.exists(ENCODINGS_FILE):
+            print(f"[WARN] Encoding file not found: {ENCODINGS_FILE}")
+            return
+        try:
+            with open(ENCODINGS_FILE, 'rb') as f:
+                data = pickle.load(f)
+            self.known_encodings, self.known_names = data
+            print(f"[INIT] Loaded {len(self.known_names)} face(s).")
+        except Exception as e:
+            print(f"[ERR] Could not load encodings: {e}")
+
+    # ── UI ──
+    def _build_ui(self):
+        self.setStyleSheet("""
+            QMainWindow {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 #0B1120, stop:1 #162033);
+            }
+            QFrame#Sidebar {
+                background: rgba(22, 32, 51, 200);
+                border-left: 1px solid rgba(56,189,248,0.08);
+            }
+            QLabel#Title {
+                color: #E2E8F0; letter-spacing: 4px; background: transparent;
+            }
+            QTextEdit {
+                background: rgba(11,17,32,200);
+                color: #CBD5E1;
+                border: 1px solid rgba(56,189,248,0.1);
+                border-radius: 10px;
+                padding: 14px;
+                font-family: 'Segoe UI','Roboto',sans-serif;
+                font-size: 13px;
+            }
+            QProgressBar {
+                background: rgba(51,65,85,60);
+                border: none; border-radius: 5px;
+                text-align: center;
+                color: #64748B; font-size: 9px; font-weight: 700;
+                height: 16px;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 #0EA5E9, stop:1 #38BDF8);
+                border-radius: 5px;
+            }
+            #Pill {
+                background: rgba(15,23,42,220);
+                border: 1px solid #334155;
+                padding: 8px 28px;
+                border-radius: 20px;
+                font-weight: 800; font-size: 11px;
+                color: #7DD3FC;
+            }
+        """)
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        main = QHBoxLayout(root)
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(0)
+
+        # ── Left: Vision ──
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(36, 36, 36, 36)
+        ll.setSpacing(20)
+
+        hdr = QHBoxLayout()
+        self.title = QLabel("ORION <span style='color:#38BDF8;'>CORE</span>")
+        self.title.setObjectName("Title")
+        self.title.setFont(QFont("Segoe UI", 22, QFont.Bold))
+        hdr.addWidget(self.title)
+        hdr.addStretch()
+        self.pill = QLabel("INITIALISING")
+        self.pill.setObjectName("Pill")
+        self.pill.setAlignment(Qt.AlignCenter)
+        hdr.addWidget(self.pill)
+        ll.addLayout(hdr)
+
+        cam_frame = QFrame()
+        cam_frame.setStyleSheet(
+            "background:#000; border-radius:14px; "
+            "border:1px solid rgba(56,189,248,0.15);")
+        cl = QVBoxLayout(cam_frame)
+        cl.setContentsMargins(4, 4, 4, 4)
+        self.video_label = QLabel()
+        self.video_label.setAlignment(Qt.AlignCenter)
+        cl.addWidget(self.video_label)
+        ll.addWidget(cam_frame, stretch=10)
+
+        metrics = QHBoxLayout()
+        self.cpu_bar = QProgressBar(); self.cpu_bar.setFormat("CPU %p%")
+        self.ram_bar = QProgressBar(); self.ram_bar.setFormat("RAM %p%")
+        metrics.addWidget(self.cpu_bar)
+        metrics.addWidget(self.ram_bar)
+        ll.addLayout(metrics)
+
+        main.addWidget(left, stretch=7)
+
+        # ── Right: Sidebar ──
+        sb = QFrame(); sb.setObjectName("Sidebar")
+        sl = QVBoxLayout(sb)
+        sl.setContentsMargins(28, 36, 28, 36)
+        sl.setSpacing(18)
+
+        lbl0 = QLabel("TASKS / AGENDA")
+        lbl0.setStyleSheet("color:#38BDF8; font-weight:bold; font-size:11px; letter-spacing:2px;")
+        sl.addWidget(lbl0)
+        
+        self.agenda_box = QTextEdit(); self.agenda_box.setReadOnly(True)
+        self.agenda_box.append("<span style='color:#94A3B8;'>- Review project Orion PR<br>- Sync with backend team<br>- Update model pipelines</span>")
+        sl.addWidget(self.agenda_box, stretch=2)
+
+        lbl = QLabel("COMMS LOG")
+        lbl.setStyleSheet("color:#38BDF8; font-weight:bold; font-size:11px; letter-spacing:2px;")
+        sl.addWidget(lbl)
+
+        self.chat = QTextEdit(); self.chat.setReadOnly(True)
+        sl.addWidget(self.chat, stretch=4)
+
+        self.input_field = QLineEdit()
+        self.input_field.setPlaceholderText("Type command here...")
+        self.input_field.setStyleSheet("""
+            QLineEdit {
+                background: rgba(11,17,32,150);
+                color: #CBD5E1; border: 1px solid rgba(56,189,248,0.2);
+                border-radius: 5px; padding: 10px; font-size: 13px;
+            }
+        """)
+        self.input_field.returnPressed.connect(self._on_manual_input)
+        sl.addWidget(self.input_field)
+
+        lbl2 = QLabel("SYSTEM ALERTS")
+        lbl2.setStyleSheet("color:#38BDF8; font-weight:bold; font-size:11px; letter-spacing:2px;")
+        sl.addWidget(lbl2)
+
+        self.alerts_box = QTextEdit(); self.alerts_box.setReadOnly(True)
+        sl.addWidget(self.alerts_box, stretch=2)
+
+        main.addWidget(sb, stretch=3)
+
+    # ── Camera ──
+    def _start_camera(self):
+        """Initialise camera without blocking the UI main loop."""
+        backends = [cv2.CAP_ANY, cv2.CAP_DSHOW, cv2.CAP_MSMF]
+        self.cap = None
+        
+        for backend in backends:
+            try:
+                if backend is not None:
+                    self.cap = cv2.VideoCapture(0, backend)
+                else:
+                    self.cap = cv2.VideoCapture(0)
+                
+                # Fast check
+                if self.cap.isOpened():
+                    ret, _ = self.cap.read()
+                    if ret:
+                        print(f"[CAM] Working on backend: {backend}")
+                        break
+            except Exception as e:
+                print(f"[CAM] Backend {backend} skipped: {e}")
+                continue
+
+        if not self.cap or not self.cap.isOpened():
+            print("[CAM ERR] All camera backends failed.")
+
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(33) # 30 FPS
+
+    # ── HUD Drawing ──
+    def _draw_hud(self, frame, x, y, w, h, name):
+        c = (248, 189, 56)   # gold
+        t = 2; L = 22
+        cv2.line(frame, (x, y),   (x+L, y),   c, t)
+        cv2.line(frame, (x, y),   (x, y+L),   c, t)
+        cv2.line(frame, (x+w, y), (x+w-L, y), c, t)
+        cv2.line(frame, (x+w, y), (x+w, y+L), c, t)
+        cv2.line(frame, (x, y+h), (x+L, y+h), c, t)
+        cv2.line(frame, (x, y+h), (x, y+h-L), c, t)
+        cv2.line(frame, (x+w, y+h), (x+w-L, y+h), c, t)
+        cv2.line(frame, (x+w, y+h), (x+w, y+h-L), c, t)
+        # Transparent label
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x, y-26), (x+len(name)*12+10, y), c, -1)
+        cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
+        cv2.putText(frame, name.upper(), (x+5, y-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
+
+    # ── Tick ──
+    def _tick(self):
+        self._update_video()
+        self._update_metrics()
+        self.pulse_alpha += 4 * self.pulse_dir
+        if self.pulse_alpha >= 240 or self.pulse_alpha <= 110:
+            self.pulse_dir *= -1
+
+    # ── Face Recognition Updates (Visuals Only) ──
+    def _on_faces_found(self, locs, names):
+        """Update face data from worker thread."""
+        self.face_locs = locs
+        self.face_names = names
+        
+        if names:
+            self.last_seen_time = time.time()
+            # Stabilize identity: Pick the most frequent name in the last 5 checks
+            self._name_buffer.append(names[0])
+            if len(self._name_buffer) > 5:
+                self._name_buffer.pop(0)
+            
+            stable_name = max(set(self._name_buffer), key=self._name_buffer.count)
+            
+            if stable_name != "UNKNOWN":
+                self.current_user = stable_name
+                if self.last_greeted_user != stable_name:
+                    if time.time() - self.last_greet_time > 30: # Longer cooldown for better UX
+                        self._request_greeting(stable_name)
+                        self.last_greeted_user = stable_name
+                        self.last_greet_time = time.time()
+        else:
+            # If nothing seen for 15s, reset identity
+            if time.time() - self.last_seen_time > 15:
+                self.current_user = "Unknown"
+                self.last_greeted_user = "Unknown"
+
+    def _update_video(self):
+        if not self.cap or not self.cap.isOpened():
+            return
+        ret, frame = self.cap.read()
+        if not ret:
+            return
+        h, w = frame.shape[:2]
+
+        # Scan line
+        self.scan_line_y = (self.scan_line_y + 3) % h
+        cv2.line(frame, (0, self.scan_line_y), (w, self.scan_line_y), (56, 189, 248), 1)
+
+        # Send to face thread periodically (every 5 GUI frames ~ 150ms)
+        if not hasattr(self, '_frame_count'): self._frame_count = 0
+        self._frame_count += 1
+        if self._frame_count % 5 == 0:
+            self.face_thread.process_frame(frame.copy())
+
+        # Draw HUD for found faces
+        # Multiplying coordinates by 2 since we resized the detection frame by 0.5
+        for (top, right, bottom, left), name in zip(self.face_locs, self.face_names):
+            self._draw_hud(frame, left*2, top*2, (right-left)*2, (bottom-top)*2, name)
+
+        # MOOD DETECTION (Placeholder logic)
+        if self.face_locs:
+            now = time.time()
+            if not hasattr(self, '_last_mood_sync') or (now - self._last_mood_sync > 10):
+                self._last_mood_sync = now
+                self._sync_mood_background("Neutral")
+
+        # Convert for Qt
+        rgb_out = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        qi = QImage(rgb_out.data, w, h, w*3, QImage.Format_RGB888)
+        self.video_label.setPixmap(
+            QPixmap.fromImage(qi).scaled(
+                self.video_label.width(), self.video_label.height(),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _check_server_health(self):
+        """Asynchronous server check to avoid UI freeze."""
+        def work():
+            try:
+                res = requests.get(f"{API_URL}/", timeout=2)
+                self.server_online = (res.status_code == 200)
+            except:
+                self.server_online = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_metrics(self):
+        self.cpu_bar.setValue(int(psutil.cpu_percent()))
+        self.ram_bar.setValue(int(psutil.virtual_memory().percent))
+
+        label = f"{'SYNCED' if self.server_online else 'OFFLINE'} · {self.current_user}".upper()
+        self.pill.setText(label)
+        
+        if self.server_online:
+            a = self.pulse_alpha
+            self.pill.setStyleSheet(
+                f"border-color:rgba(52,211,153,{a}); color:#34D399; "
+                f"background:rgba(6,78,59,120);")
+        else:
+            self.pill.setStyleSheet(
+                "border-color:#F87171; color:#F87171; background:rgba(69,10,10,120);")
+
+    def _request_greeting(self, name):
+        """Fetch a personalized greeting from the backend (port of OMNIS_5 greeting logic)."""
+        def work():
+            try:
+                # Use name.title() for cleaner IDs if needed, but OMNIS uses raw
+                res = requests.get(f"{API_URL}/greet", params={"user_id": name}, timeout=3)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("greeting"):
+                        self._on_ai_response(data["greeting"])
+            except Exception as e:
+                print(f"[GREET ERR] {e}")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _sync_mood_background(self, mood):
+        """Send detected mood to backend in a fire-and-forget thread to avoid UI lag."""
+        def work():
+            try:
+                requests.post(f"{API_URL}/mood", params={"mood": mood}, timeout=1)
+            except:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── Signals ──
+    def _on_status(self, status):
+        self.status = status
+        if status != "IDLE":
+            self.pill.setText(f"{status} · {self.current_user}".upper())
+            print(f"[STATUS] {status}")
+
+    def _on_manual_input(self):
+        text = self.input_field.text().strip()
+        if text:
+            self.input_field.clear()
+            self._on_voice_input(text)
+
+    def _on_voice_input(self, text):
+        if self.status == "SPEAKING":
+            return
+        self._log("YOU", text, "#38BDF8")
+        
+        # Improved thread management: Avoid overwriting actively running threads
+        bt = BackendThread(text, self.current_user)
+        self.backend_threads.append(bt) 
+        # Clean up finished threads
+        self.backend_threads = [t for t in self.backend_threads if not t.isFinished()]
+        
+        bt.response_received.connect(self._on_ai_response)
+        bt.error_occurred.connect(
+            lambda e: self._log("ERR", e, "#F87171"))
+        bt.start()
+        self._on_status("THINKING")
+
+    def _on_ai_response(self, text):
+        self._on_status("IDLE")
+        
+        # Style SYSTEM messages differently (e.g. rotation updates)
+        if text.startswith("SYSTEM"):
+            msg = text.replace("SYSTEM:", "").replace("SYSTEM CRITICAL:", "").strip()
+            self._log("SYS", msg, "#94A3B8")
+            # Also add to alerts box for visibility
+            self.alerts_box.append(f"<span style='color:#94A3B8;'>[SEC] {msg}</span>")
+            return
+
+        self._log("ORION", text, "#34D399")
+        self.speaker.say(text)
+
+    def _on_notification(self, text):
+        self.alerts_box.append(
+            f"<div style='padding:8px;border-left:3px solid #FDE047;"
+            f"margin:4px 0;background:rgba(253,224,71,0.05);'>"
+            f"<b style='color:#FDE047;'>ALERT:</b> {text}</div>")
+
+    def _on_new_log(self, text):
+        """Bridge console logs to the UI for real-time accountability (Pi-Sync)."""
+        # Filter noise
+        if "INFO" in text: color = "#34D399"
+        elif "WARN" in text: color = "#FDE047"
+        elif "ERR" in text: color = "#F87171"
+        else: color = "#94A3B8"
+        
+        # Display in alerts box (scrolling up)
+        short_text = text.split("-")[-1].strip() if "-" in text else text
+        self.alerts_box.append(f"<span style='color:{color}; font-size:10px;'>» {short_text}</span>")
+        
+        # FIXED: Auto-scroll to bottom to keep logs real-time
+        self.alerts_box.verticalScrollBar().setValue(
+            self.alerts_box.verticalScrollBar().maximum()
+        )
+
+    # ── Cleanup ──
+    def closeEvent(self, event):
+        self.running = False
+        if hasattr(self, 'face_thread'): self.face_thread.running = False
+        if hasattr(self, 'voice') and self.voice: self.voice.running = False
+        if hasattr(self, 'speaker') and self.speaker: self.speaker.running = False
+        if hasattr(self, 'notifier') and self.notifier: self.notifier.running = False
+        if self.cap: self.cap.release()
+        pygame.mixer.quit()
+        super().closeEvent(event)
+
+
+# ─────────────────────────────────────────────
+# 4. ENTRY POINT
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = OrionDashboard()
+    win.show()
+    sys.exit(app.exec_())

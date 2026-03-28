@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+google-generativeai
+pydantic
+sqlalchemy
+requests
+beautifulsoup4
+playwright
+python-multipart
+python-dotenv
+apscheduler
+loguru
+psutil

@@ -1,0 +1,9 @@
+opencv-python
+face_recognition
+SpeechRecognition
+requests
+pyttsx3
+pygame
+pyaudio
+gTTS
+
