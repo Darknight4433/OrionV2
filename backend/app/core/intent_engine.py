@@ -6,6 +6,7 @@ from ..services.gemini_service import GeminiService
 from ..services.ollama_service import OllamaService
 from ..services.memory_service import MemoryService
 from ..services.browser_service import BrowserService
+from ..services.vision_service import VisionService
 from ..core.security_models import PermissionMatrix
 
 class IntentEngine:
@@ -13,11 +14,13 @@ class IntentEngine:
                  gemini_service: GeminiService,
                  ollama_service: OllamaService,
                  memory_service: MemoryService,
-                 browser_service: BrowserService):
+                 browser_service: BrowserService,
+                 vision_service: VisionService = None):
         self.gemini = gemini_service
         self.ollama = ollama_service
         self.memory = memory_service
         self.browser = browser_service
+        self.vision = vision_service
         
         # OMNIS_5 Fillers
         self.fillers = [
@@ -44,12 +47,18 @@ class IntentEngine:
             (r'(?:create|add) (?:a )?task (.+)', self._handle_add_task),
         ]
 
-    async def process(self, user_id: str, text: str, stream_callback=None) -> str:
+    async def process(self, user_id: str, text: str, stream_callback=None, image_b64: Optional[str] = None) -> str:
         """
         Process user input and return response.
         If stream_callback is provided, it will yield fillers and then chunks.
         """
         text_lower = text.lower().strip()
+        
+        # 0. Handle Vision Input
+        vision_context = ""
+        if image_b64 and self.vision and any(w in text_lower for w in ["what do you see", "what am i holding", "look at this", "vision", "tell me what you see"]):
+            analysis = self.vision.analyze_image(image_b64)
+            vision_context = f"\n[System Audio-Visual Input Frame: {analysis}]\n"
         
         # 1. Deterministic Command Matching
         for pattern, handler in self.commands:
@@ -84,35 +93,39 @@ class IntentEngine:
             facts_context = "\nKnown facts about this user:\n" + "\n".join([f"- {k}: {v}" for k, v in facts.items()]) if facts else ""
             
             # Build System Prompt additions
-            enhanced_context = f"{persona_prompt}{time_context}\n{facts_context}\n"
+            enhanced_context = f"{persona_prompt}{time_context}\n{facts_context}\n{vision_context}"
             
-            # Try Gemini
+            # Try Ollama (Primary)
             try:
-                # Gemini prompt with OMNIS System identity
-                full_q = f"You are ORION, a friendly and lifelike AI system. {enhanced_context}\nYou are talking to {uid}. {q}"
-                
-                for chunk in self.gemini.get_response_stream(uid, full_q):
-                    if chunk.startswith("SYSTEM") and ("CRITICAL" in chunk or "No API keys" in chunk or "exhausted" in chunk or "error" in chunk.lower()):
+                ollama_prompt = f"System: You are ORION. {enhanced_context}\nUser: {q}"
+                for chunk in self.ollama.get_response_stream(uid, ollama_prompt):
+                    if chunk.startswith("SYSTEM ERROR"):
                         fallback_needed = True
                         break
                     
-                    # Prefix cleaning
                     clean_chunk = self._clean_response(chunk)
                     if clean_chunk:
                         full_resp += clean_chunk + " "
-                        if stream_cb: stream_cb(clean_chunk)
                 
-                if not fallback_needed and full_resp.strip():
+                # Check if Ollama has doubts or the info seems old
+                doubt_phrases = ["i'm not sure", "i don't know", "knowledge cutoff", "as an ai", "i cannot verify", "i don't have real-time", "i can't browse", "up to date"]
+                resp_lower = full_resp.lower()
+                if any(phrase in resp_lower for phrase in doubt_phrases) or not full_resp.strip():
+                    fallback_needed = True
+                
+                if not fallback_needed:
+                    if stream_cb: stream_cb(full_resp.strip()) # Output all at once to avoid streaming doubt midway
                     return full_resp.strip()
             except Exception:
                 fallback_needed = True
             
-            # Fallback to Ollama
-            if fallback_needed or not full_resp.strip():
-                if stream_cb: stream_cb("\n[System: Primary AI exhausted. Switching to Local Ollama fallback...]\n")
-                # Use the SAME enhanced prompt for Ollama to maintain personality
-                ollama_prompt = f"System: You are ORION. {enhanced_context}\nUser: {q}"
-                for chunk in self.ollama.get_response_stream(uid, ollama_prompt):
+            # Fallback to Gemini if Ollama has doubts or fails
+            if fallback_needed:
+                full_resp = "" # Reset response
+                if stream_cb: stream_cb("\n[System: Checking cloud for updated info...]\n")
+                
+                full_q = f"You are ORION, a friendly and lifelike AI system. {enhanced_context}\nYou are talking to {uid}. {q}"
+                for chunk in self.gemini.get_response_stream(uid, full_q):
                     clean_chunk = self._clean_response(chunk)
                     if clean_chunk:
                         full_resp += clean_chunk + " "

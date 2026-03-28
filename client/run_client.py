@@ -1,83 +1,35 @@
-import cv2
-import speech_recognition as sr
-import requests
-import threading
-import time
+#!/usr/bin/env python3
+"""
+ORION Client Runner
+===================
+Starts the headless terminal-based ORION client.
+
+This replaces the GUI-based client with a simpler, more reliable
+terminal interface optimized for headless deployment.
+
+Usage:
+    python run_client.py
+"""
+
+import sys
 import os
-import pickle
-import numpy as np
-import pyttsx3
-import face_recognition
-from queue import Queue, PriorityQueue, Empty
+from headless_client import main
 
-import logging
-
-# Configure Client Logging
-logging.basicConfig(
-    filename='client.log', 
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
-# --- CONFIGURATION ---
-API_URL = "http://localhost:8000"
-MATCH_THRESHOLD = 0.5
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENCODINGS_FILE = os.path.join(PROJECT_ROOT, "data", "encoded_file.p")
-
-# --- PRIORITY LEVELS ---
-PRIORITY_RESPONSE = 1 # Direct answers to user
-PRIORITY_ALERT = 2    # Notifications (can wait 5s)
-PRIORITY_IDLE = 3     # Background chatter
-
-class OrionClient:
-    def __init__(self):
-        self.recognizer = sr.Recognizer()
-        self.mic = sr.Microphone()
-        
-        self.engine = pyttsx3.init()
-        self.engine.setProperty('rate', 150)
-        
-        # Concurrency Control
-        self.input_queue = Queue()         # Mic -> Backend
-        self.output_queue = PriorityQueue() # Backend -> Speaker
-        
-        # State Flags
-        self.is_listening = True
-        self.is_speaking = False  # Robot is speaking
-        self.user_is_speaking = False # User is speaking (VAD)
-        self.current_user = "Unknown"
-        
-        self.known_face_encodings = []
-        self.known_face_names = []
-        self._load_encodings()
-
-    def _load_encodings(self):
-        if os.path.exists(ENCODINGS_FILE):
-            try:
-                print("Loading encodings...")
-                with open(ENCODINGS_FILE, 'rb') as f:
-                    data = pickle.load(f)
-                self.known_face_encodings, self.known_face_names = data
-            except Exception as e:
-                print(f"Error loading encodings: {e}")
-
-    # --- THREAD 1: EAR (Microphone) ---
-    def listen_loop(self):
-        with self.mic as source:
-            self.recognizer.adjust_for_ambient_noise(source, duration=1)
-            print("ORION Listening...")
-            
-            while True:
-                # If robot is speaking, deafen the mic slightly or pause
-                # For v2, we just pause listening logic in process loop, but keep mic open
-                try:
-                    # Capture audio
-                    audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=5)
-                    self.user_is_speaking = True # Assume speaking if energy triggers
-                    self.input_queue.put(audio)
-                    # Reset flag after short delay if no result comes back? 
-                    # Actually, process_loop will unset it.
+if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("ORION HEADLESS CLIENT")
+    print("="*70)
+    print("\nStarting ORION client...")
+    print("Make sure the backend is running: python backend/app/main.py\n")
+    
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n✓ Client shut down by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n✗ Client error: {e}")
+        sys.exit(1)
                 except sr.WaitTimeoutError:
                     self.user_is_speaking = False
                 except Exception:

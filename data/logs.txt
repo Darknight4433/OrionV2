@@ -1,0 +1,18 @@
+[2026-03-28 21:29:35] [INFO] ========================================
+[2026-03-28 21:29:35] [INFO] ORION SYSTEM BOOT
+[2026-03-28 21:29:35] [INFO] ========================================
+[2026-03-28 21:29:36] [INFO] Scheduler loop started.
+[2026-03-28 21:29:36] [INFO] Scheduler thread started.
+[2026-03-28 21:29:37] [INFO] Telegram bot started and polling.
+[2026-03-28 21:29:39] [EVENT] [STATE] IDLE → ENGAGED (was in idle for 3s)
+[2026-03-28 21:29:39] [INFO] User issued /see command for vision analysis
+[2026-03-28 21:30:17] [EVENT] User 7967530375 issued /start
+[2026-03-28 21:30:18] [WARN] /add parse error - invalid format: tea at 4 am
+[2026-03-28 21:30:36] [EVENT] [STATE] ENGAGED → ACTIVE (was in engaged for 57s)
+[2026-03-28 21:32:06] [EVENT] [STATE] ACTIVE → IDLE (was in active for 90s)
+[2026-03-28 21:33:33] [WARN] /add parse error - invalid format: tea at 4
+[2026-03-28 21:34:11] [EVENT] Task added: 'tea' @ 2026-03-16 05:06 [priority=low]
+[2026-03-28 21:34:11] [EVENT] Task added: 'tea' at 2026-03-16 05:06 [low]
+[2026-03-28 21:34:37] [EVENT] Reminder fired: tea
+[2026-03-28 21:42:17] [EVENT] User 7967530375 issued /start
+[2026-03-28 22:00:08] [EVENT] [STATE] IDLE → SLEEPING (was in idle for 1681s)

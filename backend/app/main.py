@@ -10,6 +10,7 @@ from app.services.gemini_service import GeminiService
 from app.services.ollama_service import OllamaService
 from app.services.browser_service import BrowserService
 from app.services.greeting_service import GreetingService
+from app.services.vision_service import VisionService
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.api import monitoring
@@ -52,7 +53,8 @@ memory_service = MemoryService()
 gemini_service = GeminiService(memory_service)
 ollama_service = OllamaService(memory_service)
 browser_service = BrowserService()
-intent_engine = IntentEngine(gemini_service, ollama_service, memory_service, browser_service)
+vision_service = VisionService()
+intent_engine = IntentEngine(gemini_service, ollama_service, memory_service, browser_service, vision_service)
 greeting_service = GreetingService(memory_service)
 
 # Proactive Scheduler
@@ -97,6 +99,7 @@ async def shutdown_event():
 class ChatRequest(BaseModel):
     user_id: str = "default_user"
     message: str
+    image: Optional[str] = None
 
 class ChatResponse(BaseModel):
     response: str
@@ -109,7 +112,7 @@ class NotificationResponse(BaseModel):
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     logger.info(f"User {request.user_id}: {request.message}")
-    response_text = await intent_engine.process(request.user_id, request.message)
+    response_text = await intent_engine.process(request.user_id, request.message, image_b64=request.image)
     return ChatResponse(response=response_text)
 
 @app.get("/notifications", response_model=NotificationResponse)

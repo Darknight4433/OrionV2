@@ -335,14 +335,18 @@ class BackendThread(QThread):
     response_received = pyqtSignal(str)
     error_occurred    = pyqtSignal(str)
 
-    def __init__(self, message, user_id):
+    def __init__(self, message, user_id, current_frame=None):
         super().__init__()
         self.message = message
         self.user_id = user_id
+        self.current_frame = current_frame
 
     def run(self):
         try:
             payload = {"user_id": self.user_id, "message": self.message}
+            if self.current_frame is not None:
+                _, buffer = cv2.imencode('.jpg', self.current_frame)
+                payload["image"] = base64.b64encode(buffer).decode('utf-8')
             # Unified timeout: 5s for connect, 30s for response
             res = requests.post(f"{API_URL}/chat", json=payload, timeout=(5, 30))
             if res.status_code == 200:
@@ -635,6 +639,10 @@ class OrionDashboard(QMainWindow):
         self.title.setFont(QFont("Segoe UI", 22, QFont.Bold))
         hdr.addWidget(self.title)
         hdr.addStretch()
+        self.status_label = QLabel("VOICE: IDLE")
+        self.status_label.setStyleSheet("color:#F8FAFC; font-size:12px; font-weight:700; padding: 6px 12px; border: 1px solid #38BDF8; border-radius: 10px;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        hdr.addWidget(self.status_label)
         self.pill = QLabel("INITIALISING")
         self.pill.setObjectName("Pill")
         self.pill.setAlignment(Qt.AlignCenter)
@@ -852,6 +860,15 @@ class OrionDashboard(QMainWindow):
             self.pill.setStyleSheet(
                 "border-color:#F87171; color:#F87171; background:rgba(69,10,10,120);")
 
+        # Keep voice status up-to-date independent of server health
+        self.status_label.setText(f"VOICE: {self.status}" if self.status else "VOICE: IDLE")
+        if self.status == "LISTENING":
+            self.status_label.setStyleSheet("color:#10B981; font-size:12px; font-weight:700; padding: 6px 12px; border: 1px solid #10B981; border-radius: 10px;")
+        elif self.status in ("PROCESSING", "THINKING", "SPEAKING"):
+            self.status_label.setStyleSheet("color:#FBBF24; font-size:12px; font-weight:700; padding: 6px 12px; border: 1px solid #FBBF24; border-radius: 10px;")
+        else:
+            self.status_label.setStyleSheet("color:#94A3B8; font-size:12px; font-weight:700; padding: 6px 12px; border: 1px solid #94A3B8; border-radius: 10px;")
+
     def _request_greeting(self, name):
         """Fetch a personalized greeting from the backend (port of OMNIS_5 greeting logic)."""
         def work():
@@ -878,9 +895,18 @@ class OrionDashboard(QMainWindow):
     # ── Signals ──
     def _on_status(self, status):
         self.status = status
-        if status != "IDLE":
-            self.pill.setText(f"{status} · {self.current_user}".upper())
-            print(f"[STATUS] {status}")
+        self.status_label.setText(f"VOICE: {status}")
+        if status == "LISTENING":
+            self.status_label.setStyleSheet("color:#10B981; font-size:12px; font-weight:700; padding: 6px 12px; border: 1px solid #10B981; border-radius: 10px;")
+        elif status in ("PROCESSING", "THINKING", "SPEAKING"):
+            self.status_label.setStyleSheet("color:#FBBF24; font-size:12px; font-weight:700; padding: 6px 12px; border: 1px solid #FBBF24; border-radius: 10px;")
+        elif status == "IDLE":
+            self.status_label.setStyleSheet("color:#94A3B8; font-size:12px; font-weight:700; padding: 6px 12px; border: 1px solid #94A3B8; border-radius: 10px;")
+        else:
+            self.status_label.setStyleSheet("color:#F87171; font-size:12px; font-weight:700; padding: 6px 12px; border: 1px solid #F87171; border-radius: 10px;")
+
+        self.pill.setText(f"{'SYNCED' if self.server_online else 'OFFLINE'} · {self.current_user}".upper())
+        print(f"[STATUS] {status}")
 
     def _on_manual_input(self):
         text = self.input_field.text().strip()
@@ -893,9 +919,15 @@ class OrionDashboard(QMainWindow):
             return
         self._log("YOU", text, "#38BDF8")
         
+        current_frame = None
+        if hasattr(self, 'cap') and self.cap and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if ret:
+                current_frame = frame
+                
         # Improved thread management: Avoid overwriting actively running threads
-        bt = BackendThread(text, self.current_user)
-        self.backend_threads.append(bt) 
+        bt = BackendThread(text, self.current_user, current_frame=current_frame)
+        self.backend_threads.append(bt)  
         # Clean up finished threads
         self.backend_threads = [t for t in self.backend_threads if not t.isFinished()]
         
