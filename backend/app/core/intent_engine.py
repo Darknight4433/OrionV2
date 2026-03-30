@@ -1,12 +1,15 @@
 import re
 import random
 import datetime
+import time
 from typing import Dict, Any, List, Optional
 from ..services.gemini_service import GeminiService
 from ..services.ollama_service import OllamaService
 from ..services.memory_service import MemoryService
 from ..services.browser_service import BrowserService
 from ..services.vision_service import VisionService
+from ..services.habit_service import HabitDetector
+from ..services.habit_suggester import HabitSuggester
 from ..core.security_models import PermissionMatrix
 
 class IntentEngine:
@@ -15,24 +18,28 @@ class IntentEngine:
                  ollama_service: OllamaService,
                  memory_service: MemoryService,
                  browser_service: BrowserService,
-                 vision_service: VisionService = None):
+                 vision_service: VisionService = None,
+                 habit_detector: HabitDetector = None,
+                 habit_suggester: HabitSuggester = None):
         self.gemini = gemini_service
         self.ollama = ollama_service
         self.memory = memory_service
         self.browser = browser_service
         self.vision = vision_service
+        self.habit_detector = habit_detector
+        self.habit_suggester = habit_suggester
         
-        # OMNIS_5 Fillers
+        # OMNIS_5 Fillers (professional)
         self.fillers = [
-            "Umm, let me think about that...",
+            "One moment, Sir...",
             "Checking my records...",
-            "That's interesting. One moment...",
-            "Let me search my memory banks...",
-            "I'm on it. Give me a second...",
+            "That's noted. One moment...",
+            "Let me verify that...",
+            "I'm on it, Sir...",
             "Processing your request...",
             "One moment, I am searching for an answer.",
-            "Let me consult the stars...",
-            "Analyzing trajectory..."
+            "Let me check the information...",
+            "Analyzing the details..."
         ]
         
         # Personality / Mood State
@@ -46,13 +53,30 @@ class IntentEngine:
             (r'search for (.+)', self._handle_web_search),
             (r'(?:create|add) (?:a )?task (.+)', self._handle_add_task),
         ]
+        
+        # Preference patterns to extract and store
+        self.preference_patterns = [
+            (r'i (?:prefer|like|love) (.+)', 'preference'),
+            (r'my favorite (.+) is (.+)', 'favorite'),
+            (r'i (?:don\'t|do not) like (.+)', 'dislike'),
+            (r'i hate (.+)', 'dislike'),
+            (r'i\'m (.+)', 'identity'),
+            (r'i am (.+)', 'identity'),
+        ]
 
-    async def process(self, user_id: str, text: str, stream_callback=None, image_b64: Optional[str] = None) -> str:
+    async def process(self, user_id: str, text: str, stream_callback=None, image_b64: Optional[str] = None) -> tuple[str, str]:
         """
-        Process user input and return response.
+        Process user input and return (response, ai_mode).
+        ai_mode is 'ollama', 'gemini', or 'none'
         If stream_callback is provided, it will yield fillers and then chunks.
         """
         text_lower = text.lower().strip()
+        
+        # Check for suggestion followup
+        if self.habit_suggester:
+            followup = self.habit_suggester.handle_followup(user_id, text)
+            if followup:
+                return followup, "system"
         
         # 0. Handle Vision Input
         vision_context = ""
@@ -69,17 +93,30 @@ class IntentEngine:
                 auth = PermissionMatrix.check_permissions(tool_name, {"query": text})
                 
                 if not auth["allowed"]:
-                    return f"SECURITY ALERT: {auth['reason']}"
+                    return f"SECURITY ALERT: {auth['reason']}", "system"
                 
                 if auth["needs_approval"]:
-                    return f"CONFIRMATION REQUIRED: This is a high-risk action ({tool_name}). Should I proceed?"
+                    return f"CONFIRMATION REQUIRED: This is a high-risk action ({tool_name}). Should I proceed?", "system"
                 
-                return await handler(user_id, match)
+                result = await handler(user_id, match)
+                return result, "system"
 
-        # 3. LLM Processing with Fallback and OMNIS_5 prompt logic
+        # 2. Extract and store user preferences from input
+        self._extract_preferences(user_id, text)
+
+        # 3. Memory categorization (rule + AI classifier)
+        memory_category = await self._process_memory(user_id, text)
+        logger.debug(f"[MEMORY] Category: {memory_category} for '{text[:40]}'")
+
+        # 3b. Habit detection (behavior tracking)
+        if self.habit_detector:
+            self._maybe_observe_habit(user_id, text_lower)
+
+        # 4. LLM Processing with Fallback and OMNIS_5 prompt logic
         async def run_llm(uid, q, stream_cb):
             fallback_needed = False
             full_resp = ""
+            ai_mode = "ollama"  # Default to Ollama
             
             # --- CONTEXT BUILDING (OMNIS_5 Logic) ---
             now = datetime.datetime.now()
@@ -92,12 +129,35 @@ class IntentEngine:
             facts = self.memory.get_user_facts(uid)
             facts_context = "\nKnown facts about this user:\n" + "\n".join([f"- {k}: {v}" for k, v in facts.items()]) if facts else ""
             
-            # Build System Prompt additions
-            enhanced_context = f"{persona_prompt}{time_context}\n{facts_context}\n{vision_context}"
+            # Add recent conversation history for context (shortened for latency)
+            history = self.memory.get_recent_history(uid, limit=3)
+            history_context = ""
+            if history:
+                history_context = "\nRecent:\n"
+                for user_msg, ai_msg in history[-2:]:  # Last 2 exchanges only
+                    history_context += f"U: {user_msg[:50]}...\nA: {ai_msg[:50]}...\n"
+            
+            # Add recent tasks for context (limited)
+            tasks = self.memory.get_recent_tasks(uid, limit=2)
+            tasks_context = ""
+            if tasks:
+                tasks_context = "\nTasks:\n" + "\n".join(f"- {task[:30]}..." for task in tasks[:2])
+            
+            # Contextual awareness: Check for return after inactivity
+            last_active = self.memory.get_last_activity(uid)
+            current_time = time.time()
+            inactivity_hours = (current_time - last_active) / 3600 if last_active else 24
+            
+            awareness_context = ""
+            if inactivity_hours > 2:  # User returning after 2+ hours
+                awareness_context = f"\n[Context: User returning after {int(inactivity_hours)} hours of inactivity. Consider a warm welcome.]"
+            
+            # Build System Prompt additions (concise for low latency)
+            enhanced_context = f"{time_context}\n{facts_context}\n{history_context}\n{tasks_context}\n{awareness_context}\n{vision_context}"
             
             # Try Ollama (Primary)
             try:
-                ollama_prompt = f"System: You are ORION. {enhanced_context}\nUser: {q}"
+                ollama_prompt = f"System: You are ORION, a professional AI executive assistant for Sir. {enhanced_context}\n\nINSTRUCTIONS: Be respectful, concise, and helpful. Address as 'Sir'. Focus on school administration, meetings, tasks, and study habits. Provide clear, professional responses. Keep explanations brief.\n\nUser: {q}"
                 for chunk in self.ollama.get_response_stream(uid, ollama_prompt):
                     if chunk.startswith("SYSTEM ERROR"):
                         fallback_needed = True
@@ -115,28 +175,32 @@ class IntentEngine:
                 
                 if not fallback_needed:
                     if stream_cb: stream_cb(full_resp.strip()) # Output all at once to avoid streaming doubt midway
-                    return full_resp.strip()
+                    return full_resp.strip(), ai_mode
             except Exception:
                 fallback_needed = True
             
             # Fallback to Gemini if Ollama has doubts or fails
             if fallback_needed:
+                ai_mode = "gemini"
                 full_resp = "" # Reset response
                 if stream_cb: stream_cb("\n[System: Checking cloud for updated info...]\n")
                 
-                full_q = f"You are ORION, a friendly and lifelike AI system. {enhanced_context}\nYou are talking to {uid}. {q}"
+                full_q = f"You are ORION, a professional AI executive assistant for Sir. {enhanced_context}\n\nINSTRUCTIONS: Be respectful, concise, and helpful. Address as 'Sir'. Focus on school administration, meetings, tasks, and study habits. Provide clear, professional responses. Keep explanations brief.\n\nUser: {q}"
                 for chunk in self.gemini.get_response_stream(uid, full_q):
                     clean_chunk = self._clean_response(chunk)
                     if clean_chunk:
                         full_resp += clean_chunk + " "
                         if stream_cb: stream_cb(clean_chunk)
-                return full_resp.strip()
+                return full_resp.strip(), ai_mode
 
-        if stream_callback:
-            stream_callback(random.choice(self.fillers))
-            return await run_llm(user_id, text, stream_callback)
-        else:
-            return await run_llm(user_id, text, None)
+        try:
+            if stream_callback:
+                stream_callback(random.choice(self.fillers))
+                return await run_llm(user_id, text, stream_callback)
+            else:
+                return await run_llm(user_id, text, None)
+        except Exception as e:
+            return "System is running in safe mode. Basic functions only.", "safe"
 
     async def _handle_add_meeting(self, user_id, match):
         details = match.group(1)
@@ -145,8 +209,75 @@ class IntentEngine:
 
     async def _handle_add_task(self, user_id, match):
         details = match.group(1)
-        self.memory.add_task(details)
+        self.memory.add_task(details, user_id)
         return f"Task added to your list: {details}"
+
+    async def _process_memory(self, user_id: str, text: str) -> str:
+        """3-layer memory process: rule, classifier, storage."""
+        text_clean = text.strip().lower()
+
+        # Layer 1: Rule engine
+        rule_mapping = self._extract_rule_memory(text_clean)
+        if rule_mapping:
+            category, value = rule_mapping
+            if self._should_store_memory(category, value) and not self.memory.is_duplicate_memory(user_id, category, value):
+                self.memory.add_memory_item(user_id, category, value)
+                self.memory.trim_memory(user_id, category, max_items=10)
+                return category
+            return "ignore"
+
+        # Layer 2: AI classifier
+        try:
+            category = self.ollama.classify_memory_item(text)
+        except Exception as e:
+            logger.error(f"Memory classification call failed: {e}")
+            category = "ignore"
+
+        if category in {"preference", "habit", "fact"}:
+            if self._should_store_memory(category, text) and not self.memory.is_duplicate_memory(user_id, category, text):
+                self.memory.add_memory_item(user_id, category, text.strip())
+                self.memory.trim_memory(user_id, category, max_items=10)
+                return category
+            return "ignore"
+
+        return "ignore"
+
+    def _should_store_memory(self, category: str, text: str) -> bool:
+        """Confidence rules for storing memory."""
+        if category == "ignore":
+            return False
+        if not text or len(text.strip()) < 12:
+            return False
+        return True
+
+    def _maybe_observe_habit(self, user_id: str, text_lower: str):
+        actions = {
+            "study": "study",
+            "eat": "eat",
+            "sleep": "sleep",
+            "drink": "drink",
+            "code": "code"
+        }
+
+        for pattern, action in actions.items():
+            if f" {pattern}" in text_lower or text_lower.startswith(pattern):
+                self.habit_detector.observe(user_id, action)
+                break
+
+    def _extract_rule_memory(self, text: str):
+        """Matches explicit patterns for fast memory extraction."""
+        if "i like" in text or "i love" in text or "i prefer" in text:
+            value = text.replace("i like", "").replace("i love", "").replace("i prefer", "").strip()
+            return "preference", value if value else text
+        if "my name is" in text:
+            name = text.split("my name is", 1)[1].strip()
+            return "fact", f"name:{name}" if name else "name:unknown"
+        if "i always" in text or "i usually" in text or "i often" in text:
+            return "habit", text
+        if "i am" in text or "i'm" in text:
+            if "i am" in text and len(text.split()) < 10:
+                return "fact", text
+        return None
 
     async def _handle_time_check(self, user_id, match):
         now = datetime.datetime.now()
@@ -171,9 +302,28 @@ class IntentEngine:
             response += self._clean_response(chunk)
         return response.strip()
 
+    def _extract_preferences(self, user_id: str, text: str):
+        """Extract user preferences from conversation and store as facts."""
+        text_lower = text.lower()
+        for pattern, pref_type in self.preference_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                if pref_type == 'preference':
+                    value = match.group(1).strip()
+                    self.memory.store_fact(user_id, f"prefers_{value.replace(' ', '_')}", "true")
+                elif pref_type == 'favorite':
+                    category = match.group(1).strip()
+                    item = match.group(2).strip()
+                    self.memory.store_fact(user_id, f"favorite_{category.replace(' ', '_')}", item)
+                elif pref_type == 'dislike':
+                    value = match.group(1).strip()
+                    self.memory.store_fact(user_id, f"dislikes_{value.replace(' ', '_')}", "true")
+                elif pref_type == 'identity':
+                    identity = match.group(1).strip()
+                    self.memory.store_fact(user_id, "identity", identity)
+
     def _clean_response(self, text: str) -> str:
-        """Forcefully remove AI/ORION/OMNIS prefixes to keep conversation natural."""
-        # Clean both start of line and inline prefixes often generated by small models
+        """Normalize AI response text."""
         cleaned = re.sub(r'(?i)^(AI|ORION|OMNIS|SYSTEM):\s*', '', text)
         cleaned = re.sub(r'(?i)\n(AI|ORION|OMNIS|SYSTEM):\s*', '\n', cleaned)
         return cleaned.strip()

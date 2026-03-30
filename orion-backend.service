@@ -1,0 +1,13 @@
+[Unit]
+Description=ORION AI Assistant Backend
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/PROJECT-ORION
+ExecStart=/usr/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

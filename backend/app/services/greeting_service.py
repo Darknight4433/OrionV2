@@ -19,6 +19,10 @@ class GreetingService:
         self.nicknames = {
             "Vaishnavi": "vaaish",
             "Vaishnavi L": "vaaish",
+            "sukumaran": "sir",
+            "Deva Nandan":"deva",
+            "shinila":"shinila",
+            "pooja mam" : "mam",
         }
         
     def _get_time_of_day_greeting(self) -> str:

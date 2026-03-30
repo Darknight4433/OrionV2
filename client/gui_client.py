@@ -127,22 +127,18 @@ class VoiceThread(QThread):
 
 
 class SpeakerThread(QThread):
-    """TTS engine — Sarvam AI with key rotation, pyttsx3 fallback."""
+    """Multi-engine TTS router — Sarvam (Indian) → ElevenLabs (English) → gTTS (offline)."""
     status_changed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        # Offline fallback
-        self.offline_engine = pyttsx3.init()
-        self.offline_engine.setProperty('rate', 165)
-        
-        # Try to find a better offline voice (like Zira or Hazel)
-        voices = self.offline_engine.getProperty('voices')
-        if len(voices) > 1:
-            for v in voices:
-                if "Zira" in v.name or "Hazel" in v.name or "Female" in v.name:
-                    self.offline_engine.setProperty('voice', v.id)
-                    break
+        # gTTS offline fallback
+        try:
+            from gtts import gTTS
+            self.gtts_available = True
+        except ImportError:
+            self.gtts_available = False
+            print("[TTS] gTTS not available - offline voice limited")
 
         # Sarvam rotation state
         self.sarvam_keys  = SARVAM_API_KEYS
@@ -176,6 +172,31 @@ class SpeakerThread(QThread):
         print(f"[TTS] Rotating → Sarvam Key #{self.sarvam_index}")
         self._init_sarvam()
 
+    # ── Language detection ──
+    def _detect_language(self, text: str) -> str:
+        """Returns 'hindi', 'english', or 'unknown'."""
+        # Check for Devanagari script (Hindi, Marathi, etc.)
+        if any('\u0900' <= char <= '\u097F' for char in text):
+            return "hindi"
+        
+        # Check for other Indian scripts
+        indian_scripts = [
+            ('\u0980', '\u09FF'),  # Bengali
+            ('\u0A00', '\u0A7F'),  # Gurmukhi (Punjabi)
+            ('\u0A80', '\u0AFF'),  # Gujarati
+            ('\u0B00', '\u0B7F'),  # Oriya
+            ('\u0B80', '\u0BFF'),  # Tamil
+            ('\u0C00', '\u0C7F'),  # Telugu
+            ('\u0C80', '\u0CFF'),  # Kannada
+            ('\u0D00', '\u0D7F'),  # Malayalam
+        ]
+        for start, end in indian_scripts:
+            if any(start <= char <= end for char in text):
+                return "hindi"  # Treat all Indian languages as Hindi for Sarvam
+        
+        # Default to English
+        return "english"
+
     # ── Playback ──
     def _play_audio(self, audio_bytes):
         """Write audio bytes to a temp .wav file and play through pygame."""
@@ -208,6 +229,45 @@ class SpeakerThread(QThread):
 
         self.queue.put((priority, text))
 
+    def speak_response(self, text, ai_mode="ollama"):
+        """
+        Strict cascade TTS routing based on AI mode.
+        Always resolves, never loops.
+        """
+        if not text or text.startswith("SYSTEM"):
+            return
+
+        try:
+            # Detect language
+            lang = self._detect_language(text)
+
+            # Strict cascade based on AI mode
+            if ai_mode == "tinyllama":
+                # Offline mode → always use gTTS
+                self._speak_offline(text)
+                return
+
+            if lang != "english":
+                # Non-English → Sarvam AI
+                if not self._speak_sarvam(text):
+                    self._speak_offline(text)
+                return
+
+            # English → ElevenLabs → Sarvam → gTTS (strict order)
+            if self._speak_elevenlabs(text):
+                return
+            if self._speak_sarvam(text):
+                return
+            self._speak_offline(text)
+
+        except Exception as e:
+            print(f"[VOICE ERROR] {e}")
+            # Final fallback - always try to speak something
+            try:
+                self._speak_offline(text)
+            except:
+                pass
+
     # ── Main loop ──
     def run(self):
         while self.running:
@@ -225,18 +285,20 @@ class SpeakerThread(QThread):
 
                 self.status_changed.emit("SPEAKING")
                 
-                # Language detection: simple check for Hindi/Devanagari characters
-                is_hindi = any('\u0900' <= char <= '\u097F' for char in sentence)
-                
+                # Route based on language and AI mode
+                lang = self._detect_language(sentence)
                 spoken = False
-                if not is_hindi and self.eleven_api_key:
-                    # English text -> ElevenLabs first
-                    spoken = self._speak_elevenlabs(sentence)
                 
-                if not spoken:
-                    # Hindi text or ElevenLabs failure -> Sarvam (priya voice)
+                if lang == "hindi":
+                    # Indian languages → Sarvam AI
                     spoken = self._speak_sarvam(sentence)
+                else:
+                    # English → ElevenLabs first, then Sarvam, then gTTS
+                    spoken = self._speak_elevenlabs(sentence)
+                    if not spoken:
+                        spoken = self._speak_sarvam(sentence)
                 
+                # Final offline fallback
                 if not spoken:
                     self._speak_offline(sentence)
 
@@ -321,11 +383,40 @@ class SpeakerThread(QThread):
             return False
 
     def _speak_offline(self, text):
-        """pyttsx3 fallback for when no API keys work."""
+        """gTTS fallback for when no API keys work."""
         print("[TTS] Falling back to offline voice.")
         try:
-            self.offline_engine.say(text)
-            self.offline_engine.runAndWait()
+            if self.gtts_available:
+                from gtts import gTTS
+                tts = gTTS(text=text, lang='en', slow=False)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
+                    tts.save(fp.name)
+                    temp_path = fp.name
+                
+                try:
+                    pygame.mixer.music.load(temp_path)
+                    pygame.mixer.music.play()
+                    while pygame.mixer.music.get_busy():
+                        time.sleep(0.05)
+                    pygame.mixer.music.unload()
+                finally:
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
+            else:
+                # Basic pyttsx3 fallback if gTTS not available
+                import pyttsx3
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 165)
+                voices = engine.getProperty('voices')
+                if len(voices) > 1:
+                    for v in voices:
+                        if "Zira" in v.name or "Hazel" in v.name or "Female" in v.name:
+                            engine.setProperty('voice', v.id)
+                            break
+                engine.say(text)
+                engine.runAndWait()
         except Exception as e:
             print(f"[OFFLINE ERR] {e}")
 

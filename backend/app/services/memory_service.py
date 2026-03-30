@@ -56,6 +56,24 @@ class MemoryService:
                         read_status INTEGER DEFAULT 0
                     )
                 ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS memory_items (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT,
+                        category TEXT,
+                        content TEXT,
+                        timestamp REAL
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS habit_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT,
+                        action TEXT,
+                        bucket TEXT,
+                        timestamp REAL
+                    )
+                ''')
                 
                 # Check for permanent column (migration)
                 try:
@@ -141,19 +159,90 @@ class MemoryService:
             logger.error(f"Latest Topic Error: {e}")
             return None
 
-    def check_missed_meetings(self):
-        """Find alerts that should have fired but haven't."""
-        now = time.time()
+    def add_memory_item(self, user_id: str, category: str, item: str):
+        """Store classified memory item for user."""
+        if category not in {"preference", "habit", "fact"}:
+            return
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT id, content FROM system_alerts WHERE scheduled_time < ? AND read_status = 0",
-                    (now,)
+                    "INSERT INTO memory_items (user_id, category, content, timestamp) VALUES (?, ?, ?, ?)",
+                    (user_id, category, item.strip(), time.time())
                 )
-                return cursor.fetchall()
-        except Exception:
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Add Memory Item Error: {e}")
+
+    def get_memory_items(self, user_id: str, category: str = None, limit: int = 10):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                if category:
+                    cursor.execute(
+                        "SELECT content FROM memory_items WHERE user_id = ? AND category = ? ORDER BY timestamp DESC LIMIT ?",
+                        (user_id, category, limit)
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT category, content FROM memory_items WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+                        (user_id, limit)
+                    )
+                rows = cursor.fetchall()
+                if category:
+                    return [row[0] for row in rows]
+                return [{"category": row[0], "content": row[1]} for row in rows]
+        except Exception as e:
+            logger.error(f"Get Memory Items Error: {e}")
             return []
+
+    def get_last_activity(self, user_id: str):
+        """Fetch the timestamp of the latest conversation for the user."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT MAX(timestamp) FROM conversation_history WHERE user_id = ?",
+                    (user_id,)
+                )
+                row = cursor.fetchone()
+                return row[0] if row and row[0] else None
+        except Exception as e:
+            logger.error(f"Get Last Activity Error: {e}")
+            return None
+
+    def is_duplicate_memory(self, user_id: str, category: str, item: str) -> bool:
+        """Check whether a memory item already exists with the same category and overlapping content."""
+        if category not in {"preference", "habit", "fact"}:
+            return False
+        existing = self.get_memory_items(user_id, category=category, limit=50)
+        norm_item = item.strip().lower()
+        for existing_item in existing:
+            if norm_item in existing_item.lower() or existing_item.lower() in norm_item:
+                return True
+        return False
+
+    def trim_memory(self, user_id: str, category: str, max_items: int = 10):
+        """Trim memory items to keep per-category history bounded."""
+        if category not in {"preference", "habit", "fact"}:
+            return
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id FROM memory_items WHERE user_id = ? AND category = ? ORDER BY timestamp DESC",
+                    (user_id, category)
+                )
+                rows = cursor.fetchall()
+                if len(rows) > max_items:
+                    ids_to_delete = [r[0] for r in rows[max_items:]]
+                    cursor.executemany(
+                        "DELETE FROM memory_items WHERE id = ?",
+                        [(i,) for i in ids_to_delete]
+                    )
+                    conn.commit()
+        except Exception as e:
+            logger.error(f"Trim Memory Error: {e}")
 
     def get_pending_notifications(self, user_id: str = "default_user"):
         """Serve unread alerts to the client."""
@@ -187,16 +276,105 @@ class MemoryService:
         except Exception as e:
             logger.error(f"Maintenance Error: {e}")
 
-    def add_task(self, details: str, user_id: str = "default_user"):
+    def add_system_alert(self, user_id: str, content: str, alert_type: str = "general", scheduled_time: float = None):
+        """Add a system alert/notification."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                st = scheduled_time if scheduled_time is not None else time.time()
+                cursor.execute(
+                    "INSERT INTO system_alerts (user_id, content, alert_type, scheduled_time) VALUES (?, ?, ?, ?)",
+                    (user_id, content, alert_type, st)
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Add System Alert Error: {e}")
+
+    def add_task(self, details: str, user_id: str = "default_user", scheduled_time: float = None):
         """Store a task or meeting in the system_alerts table."""
+        try:
+            alert_type = "task"
+            if details.strip().lower().startswith("meeting"):
+                alert_type = "meeting"
+            st = scheduled_time if scheduled_time is not None else time.time()
+            self.add_system_alert(user_id, details, alert_type, st)
+            logger.info(f"{alert_type.title()} stored: {details}")
+        except Exception as e:
+            logger.error(f"Add Task Error: {e}")
+
+    def get_recent_tasks(self, user_id: str, limit: int = 5):
+        """Get recent tasks for context."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "INSERT INTO system_alerts (user_id, content, alert_type, scheduled_time) VALUES (?, ?, ?, ?)",
-                    (user_id, details, "task", time.time())
+                    "SELECT content FROM system_alerts WHERE user_id = ? AND alert_type = 'task' ORDER BY scheduled_time DESC LIMIT ?",
+                    (user_id, limit)
                 )
-                conn.commit()
-                logger.info(f"Task stored: {details}")
+                tasks = cursor.fetchall()
+                return [task[0] for task in tasks]
         except Exception as e:
-            logger.error(f"Add Task Error: {e}")
+            logger.error(f"Get Tasks Error: {e}")
+            return []
+
+    def get_upcoming_meetings(self, user_id: str, window_minutes: int = 60):
+        """Get meetings that are due within the given window."""
+        try:
+            now = time.time()
+            cutoff = now + (window_minutes * 60)
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT content, scheduled_time FROM system_alerts WHERE user_id = ? AND alert_type = 'meeting' AND scheduled_time BETWEEN ? AND ? ORDER BY scheduled_time",
+                    (user_id, now, cutoff)
+                )
+                rows = cursor.fetchall()
+                return [{"content": r[0], "scheduled_time": r[1]} for r in rows]
+        except Exception as e:
+            logger.error(f"Get Meetings Error: {e}")
+            return []
+
+    def get_pending_tasks(self, user_id: str, limit: int = 10):
+        """Get pending tasks (non-meeting)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT content, scheduled_time FROM system_alerts WHERE user_id = ? AND alert_type = 'task' ORDER BY scheduled_time DESC LIMIT ?",
+                    (user_id, limit)
+                )
+                rows = cursor.fetchall()
+                return [{"content": r[0], "scheduled_time": r[1]} for r in rows]
+        except Exception as e:
+            logger.error(f"Get Pending Tasks Error: {e}")
+            return []
+
+    def get_pending_reminders(self, user_id: str, limit: int = 10):
+        """Get pending reminders."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT content, scheduled_time FROM system_alerts WHERE user_id = ? AND alert_type = 'reminder' ORDER BY scheduled_time DESC LIMIT ?",
+                    (user_id, limit)
+                )
+                rows = cursor.fetchall()
+                return [{"content": r[0], "scheduled_time": r[1]} for r in rows]
+        except Exception as e:
+            logger.error(f"Get Pending Reminders Error: {e}")
+            return []
+
+    def get_last_activity(self, user_id: str):
+        """Get timestamp of last user activity."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT MAX(timestamp) FROM conversation_history WHERE user_id = ?",
+                    (user_id,)
+                )
+                row = cursor.fetchone()
+                return row[0] if row and row[0] else None
+        except Exception as e:
+            logger.error(f"Get Last Activity Error: {e}")
+            return None

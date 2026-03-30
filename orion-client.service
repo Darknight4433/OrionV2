@@ -1,0 +1,14 @@
+[Unit]
+Description=ORION AI Assistant Client
+After=network.target orion-backend.service
+Requires=orion-backend.service
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/PROJECT-ORION
+ExecStart=/usr/bin/python3 client/headless_client.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

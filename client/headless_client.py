@@ -30,6 +30,7 @@ import traceback
 from datetime import datetime
 import logging
 from typing import Optional, Tuple
+import gc
 
 # Audio/Speech
 import speech_recognition as sr
@@ -48,9 +49,268 @@ try:
 except ImportError:
     VISION_AVAILABLE = False
 
+# TTS Services
+try:
+    from gtts import gTTS
+    GTTS_AVAILABLE = True
+except ImportError:
+    GTTS_AVAILABLE = False
+
+try:
+    import elevenlabs
+    ELEVENLABS_AVAILABLE = True
+except ImportError:
+    ELEVENLABS_AVAILABLE = False
+
+try:
+    from sarvam_sdk import SarvamAI
+    SARVAM_AVAILABLE = True
+except ImportError:
+    SARVAM_AVAILABLE = False
+
 # ============================================================================
-# CONFIGURATION
+# TTS SERVICES (Strict Cascade)
 # ============================================================================
+
+class TTSService:
+    """Multi-engine TTS with strict cascade routing"""
+    
+    def __init__(self):
+        self.sarvam_client = None
+        self.eleven_client = None
+        self.sarvam_keys = []
+        self.sarvam_index = 0
+        self.interrupt_flag = False  # For interrupt system
+        
+        # Initialize Sarvam
+        if SARVAM_AVAILABLE:
+            sarvam_keys_raw = os.environ.get("SARVAM_API_KEYS", "")
+            if sarvam_keys_raw:
+                try:
+                    self.sarvam_keys = json.loads(sarvam_keys_raw.replace("'", '"'))
+                    if self.sarvam_keys:
+                        self.sarvam_client = SarvamAI(api_key=self.sarvam_keys[0])
+                        logger.info(f"✓ Sarvam TTS initialized with {len(self.sarvam_keys)} keys")
+                except Exception as e:
+                    logger.warning(f"Sarvam init failed: {e}")
+        
+        # Initialize ElevenLabs
+        if ELEVENLABS_AVAILABLE:
+            eleven_key = os.environ.get("ELEVENLABS_API_KEY")
+            eleven_voice = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+            if eleven_key:
+                try:
+                    elevenlabs.set_api_key(eleven_key)
+                    self.eleven_client = elevenlabs
+                    self.eleven_voice_id = eleven_voice
+                    logger.info("✓ ElevenLabs TTS initialized")
+                except Exception as e:
+                    logger.warning(f"ElevenLabs init failed: {e}")
+        
+        if GTTS_AVAILABLE:
+            logger.info("✓ gTTS fallback available")
+    
+    def interrupt(self):
+        """Interrupt current speech"""
+        self.interrupt_flag = True
+        try:
+            pygame.mixer.music.stop()
+        except:
+            pass
+    
+    def is_interrupted(self):
+        """Check if interrupted"""
+        return self.interrupt_flag
+    
+    def _detect_language(self, text: str) -> str:
+        """Simple language detection"""
+        # Check for Devanagari (Hindi)
+        if any('\u0900' <= char <= '\u097F' for char in text):
+            return "hindi"
+        # Check for other Indic scripts
+        if any('\u0980' <= char <= '\u09FF' for char in text):  # Bengali
+            return "bengali"
+        if any('\u0A80' <= char <= '\u0AFF' for char in text):  # Gujarati
+            return "gujarati"
+        if any('\u0B00' <= char <= '\u0B7F' for char in text):  # Oriya
+            return "oriya"
+        if any('\u0C00' <= char <= '\u0C7F' for char in text):  # Telugu
+            return "telugu"
+        if any('\u0D00' <= char <= '\u0D7F' for char in text):  # Malayalam
+            return "malayalam"
+        if any('\u0E00' <= char <= '\u0E7F' for char in text):  # Thai
+            return "thai"
+        return "english"
+    
+    def _speak_offline(self, text: str) -> bool:
+        """gTTS offline fallback"""
+        if not GTTS_AVAILABLE:
+            return False
+        
+        try:
+            tts = gTTS(text=text, lang='en')
+            temp_file = f"temp_tts_{int(time.time())}.mp3"
+            tts.save(temp_file)
+            
+            # Play with pygame (interruptible)
+            pygame.mixer.music.load(temp_file)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy() and not self.is_interrupted():
+                time.sleep(0.1)
+            pygame.mixer.music.stop()
+            
+            # Reset interrupt flag
+            self.interrupt_flag = False
+            
+            # Cleanup
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+            
+            logger.info("TTS: gTTS success")
+            return True
+        except Exception as e:
+            logger.error(f"gTTS failed: {e}")
+            return False
+    
+    def _speak_elevenlabs(self, text: str) -> bool:
+        """ElevenLabs TTS"""
+        if not self.eleven_client:
+            return False
+        
+        try:
+            audio = self.eleven_client.generate(
+                text=text,
+                voice=self.eleven_voice_id,
+                model="eleven_monolingual_v1"
+            )
+            
+            temp_file = f"temp_tts_{int(time.time())}.mp3"
+            with open(temp_file, 'wb') as f:
+                f.write(audio)
+            
+            pygame.mixer.music.load(temp_file)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy() and not self.is_interrupted():
+                time.sleep(0.1)
+            pygame.mixer.music.stop()
+            
+            # Reset interrupt flag
+            self.interrupt_flag = False
+            
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+            
+            logger.info("TTS: ElevenLabs success")
+            return True
+        except Exception as e:
+            logger.error(f"ElevenLabs failed: {e}")
+            return False
+    
+    def _speak_sarvam(self, text: str) -> bool:
+        """Sarvam TTS with key rotation"""
+        if not self.sarvam_client or not self.sarvam_keys:
+            return False
+        
+        retries = 0
+        max_retries = len(self.sarvam_keys)
+        
+        while retries < max_retries:
+            try:
+                response = self.sarvam_client.text_to_speech.convert(
+                    text=text,
+                    target_language_code="en-IN",
+                    speaker="priya",
+                    model="bulbul:v2"
+                )
+                
+                audio_bytes = None
+                if hasattr(response, 'audios') and response.audios:
+                    audio_bytes = base64.b64decode(response.audios[0])
+                elif isinstance(response, dict) and 'audios' in response:
+                    audio_bytes = base64.b64decode(response['audios'][0])
+                
+                if audio_bytes and len(audio_bytes) > 100:
+                    # Save to temp file and play
+                    temp_file = f"temp_tts_{int(time.time())}.wav"
+                    with open(temp_file, 'wb') as f:
+                        f.write(audio_bytes)
+                    
+                    pygame.mixer.music.load(temp_file)
+                    pygame.mixer.music.play()
+                    while pygame.mixer.music.get_busy() and not self.is_interrupted():
+                        time.sleep(0.1)
+                    pygame.mixer.music.stop()
+                    
+                    # Reset interrupt flag
+                    self.interrupt_flag = False
+                    
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+                    
+                    logger.info(f"TTS: Sarvam success (key #{self.sarvam_index})")
+                    return True
+                else:
+                    logger.warning("Sarvam returned empty audio")
+            
+            except Exception as e:
+                logger.error(f"Sarvam key #{self.sarvam_index} failed: {e}")
+            
+            # Rotate key
+            self.sarvam_index = (self.sarvam_index + 1) % len(self.sarvam_keys)
+            if self.sarvam_client:
+                self.sarvam_client = SarvamAI(api_key=self.sarvam_keys[self.sarvam_index])
+            retries += 1
+            time.sleep(1)
+        
+        return False
+    
+    def speak_response(self, text: str, ai_mode: str = "ollama"):
+        """
+        Strict cascade TTS routing based on AI mode.
+        Always resolves, never loops.
+        """
+        if not text or text.startswith("SYSTEM"):
+            return
+        
+        try:
+            # Detect language
+            lang = self._detect_language(text)
+            
+            # Strict cascade based on AI mode
+            if ai_mode == "tinyllama":
+                # Offline mode → always use gTTS
+                if not self._speak_offline(text):
+                    logger.warning("All TTS engines failed for TinyLlama mode")
+                return
+            
+            if lang != "english":
+                # Non-English → Sarvam AI → gTTS
+                if not self._speak_sarvam(text):
+                    if not self._speak_offline(text):
+                        logger.warning("All TTS engines failed for non-English text")
+                return
+            
+            # English → ElevenLabs → Sarvam → gTTS (strict order)
+            if self._speak_elevenlabs(text):
+                return
+            if self._speak_sarvam(text):
+                return
+            if not self._speak_offline(text):
+                logger.warning("All TTS engines failed for English text")
+        
+        except Exception as e:
+            logger.error(f"TTS cascade error: {e}")
+            # Final fallback
+            try:
+                self._speak_offline(text)
+            except:
+                logger.error("Complete TTS failure")
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(PROJECT_ROOT)
@@ -94,13 +354,40 @@ THREAD_TIMEOUT = 30
 # ============================================================================
 
 def init_audio() -> bool:
-    """Initialize audio system"""
+    """Initialize audio system with recovery capability"""
     try:
         pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
         logger.info("✓ Audio mixer initialized")
         return True
     except Exception as e:
         logger.warning(f"Audio mixer init failed: {e}")
+        return False
+
+def recover_audio() -> bool:
+    """Recover audio system on hardware lock"""
+    try:
+        # Stop any playing audio
+        pygame.mixer.music.stop()
+        pygame.mixer.quit()
+        
+        # Try to restart ALSA (Linux/Pi specific)
+        import subprocess
+        try:
+            subprocess.run(['sudo', 'systemctl', 'restart', 'alsa-utils'], 
+                         capture_output=True, timeout=5)
+            logger.info("ALSA restarted for audio recovery")
+        except:
+            pass  # ALSA restart may not be available
+        
+        # Reinitialize pygame
+        time.sleep(1)
+        success = init_audio()
+        if success:
+            logger.info("✓ Audio system recovered")
+        return success
+        
+    except Exception as e:
+        logger.error(f"Audio recovery failed: {e}")
         return False
 
 def init_microphone() -> Tuple[Optional[sr.Recognizer], Optional[sr.Microphone]]:
@@ -124,25 +411,6 @@ def init_microphone() -> Tuple[Optional[sr.Recognizer], Optional[sr.Microphone]]
         logger.error(f"Microphone init failed: {e}")
         return None, None
 
-def init_speaker() -> Optional[pyttsx3.TTS]:
-    """Initialize TTS engine"""
-    try:
-        engine = pyttsx3.init()
-        engine.setProperty('rate', 150)
-        
-        voices = engine.getProperty('voices')
-        if len(voices) > 1:
-            for v in voices:
-                if any(x in v.name for x in ['Zira', 'Hazel', 'Female', 'Victoria']):
-                    engine.setProperty('voice', v.id)
-                    break
-        
-        logger.info("✓ Text-to-speech engine initialized")
-        return engine
-    except Exception as e:
-        logger.error(f"TTS init failed: {e}")
-        return None
-
 # ============================================================================
 # VISION (Hardened for Pi)
 # ============================================================================
@@ -156,6 +424,7 @@ class VisionManager:
         self.frame_lock = threading.Lock()
         self.running = False
         self.last_capture_time = 0
+        self.last_frame_time = 0  # For FPS capping
         self.capture_thread = None
         self.error_count = 0
         self.MAX_ERRORS = 5
@@ -185,31 +454,79 @@ class VisionManager:
         except Exception as e:
             logger.warning(f"Camera init failed: {e}")
     
+    def _should_process_frame(self) -> bool:
+        """FPS capping to prevent CPU spikes - max 3 FPS processing"""
+        now = time.time()
+        if now - self.last_frame_time < 0.33:  # ~3 FPS (1/0.33 ≈ 3)
+            return False
+        self.last_frame_time = now
+        return True
+    
     def _capture_loop(self):
-        """Continuously capture frames (isolated from encoding)"""
+        """Continuously capture frames (isolated from encoding) with camera recovery and FPS capping"""
         while self.running:
             try:
                 ret, frame = self.cap.read()
                 if ret and frame is not None:
-                    with self.frame_lock:
-                        # Only keep latest frame (discard old one)
-                        self.frame = frame
-                        self.error_count = 0
-                    self.last_capture_time = time.time()
+                    # Only process frame if FPS cap allows (prevents CPU spikes)
+                    if self._should_process_frame():
+                        with self.frame_lock:
+                            # Only keep latest frame (discard old one)
+                            self.frame = frame
+                            self.error_count = 0
+                        self.last_capture_time = time.time()
                 else:
                     self.error_count += 1
                     if self.error_count > self.MAX_ERRORS:
-                        logger.error("Camera capture failed repeatedly")
+                        logger.error("Camera capture failed repeatedly - attempting recovery")
+                        self._recover_camera()
                         break
                 
-                time.sleep(0.067)  # ~15 FPS (CPU-friendly on Pi)
+                time.sleep(0.067)  # ~15 FPS capture (CPU-friendly on Pi)
             
             except Exception as e:
                 logger.error(f"Capture error: {e}")
                 self.error_count += 1
                 if self.error_count > self.MAX_ERRORS:
+                    logger.error("Camera capture failed repeatedly - attempting recovery")
+                    self._recover_camera()
                     break
                 time.sleep(1)
+    
+    def _recover_camera(self):
+        """Camera recovery: release and reinitialize on failure"""
+        try:
+            # Release current camera
+            if self.cap:
+                self.cap.release()
+                logger.info("Camera released for recovery")
+            
+            time.sleep(2)  # Wait before reinitializing
+            
+            # Reinitialize camera
+            self.cap = cv2.VideoCapture(0)
+            if self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                self.cap.set(cv2.CAP_PROP_FPS, 15)
+                self.error_count = 0
+                logger.info("✓ Camera recovered successfully")
+                
+                # Restart capture loop
+                if not self.capture_thread or not self.capture_thread.is_alive():
+                    self.capture_thread = threading.Thread(
+                        target=self._capture_loop,
+                        daemon=True,
+                        name="CameraThread"
+                    )
+                    self.capture_thread.start()
+            else:
+                logger.error("Camera recovery failed - camera not available")
+                self.running = False
+                
+        except Exception as e:
+            logger.error(f"Camera recovery failed: {e}")
+            self.running = False
     
     def get_frame_b64(self) -> Optional[str]:
         """Get current frame as base64 (encoding happens outside lock)"""
@@ -248,7 +565,7 @@ class VisionManager:
 # BACKEND COMMUNICATION (with retry)
 # ============================================================================
 
-def send_to_backend(user_input: str, image_b64: Optional[str] = None) -> str:
+def send_to_backend(user_input: str, image_b64: Optional[str] = None) -> Tuple[str, str]:
     """Send message to backend with retry logic and timeouts"""
     payload = {
         "user_id": USER_ID,
@@ -273,8 +590,9 @@ def send_to_backend(user_input: str, image_b64: Optional[str] = None) -> str:
             if resp.status_code == 200:
                 data = resp.json()
                 response = data.get("response", "No response from backend")
-                logger.info(f"[RESPONSE] {response[:50]}...")
-                return response
+                ai_mode = data.get("ai_mode", "ollama")
+                logger.info(f"[RESPONSE] {response[:50]}... (mode: {ai_mode})")
+                return response, ai_mode
             else:
                 logger.error(f"Backend error: {resp.status_code}")
         
@@ -288,7 +606,7 @@ def send_to_backend(user_input: str, image_b64: Optional[str] = None) -> str:
         if attempt < BACKEND_RETRY_COUNT - 1:
             time.sleep(2)  # Wait before retry
     
-    return "Backend not responding. Please try again."
+    return "Backend not responding. Please try again.", "system"
 
 # ============================================================================
 # INPUT PIPELINE (Non-blocking)
@@ -311,6 +629,7 @@ class InputThread(threading.Thread):
             return
         
         logger.info("[INPUT] Voice listening started")
+        no_audio_counter = 0
         
         # Non-blocking with timeout
         try:
@@ -329,30 +648,89 @@ class InputThread(threading.Thread):
                             text = self.recognizer.recognize_google(audio)
                             if text:
                                 self.last_activity = time.time()
+                                no_audio_counter = 0  # Reset counter on successful recognition
                                 logger.info(f"[HEARD] {text}")
-                                self.output_queue.put(("voice", text))
+                                
+                                # Interrupt current speech for natural conversation
+                                if hasattr(self, 'tts_service') and self.tts_service:
+                                    self.tts_service.interrupt()
+                                
+                                self.output_queue.put((1, ("voice", text)))  # Priority 1: voice
+                            else:
+                                no_audio_counter += 1
                         except sr.UnknownValueError:
+                            no_audio_counter += 1  # Count as no audio detected
                             pass  # Couldn't understand
                         except sr.RequestError as e:
                             logger.warning(f"Google API unavailable: {e}")
+                            no_audio_counter += 1
                     
                     except sr.WaitTimeoutError:
+                        no_audio_counter += 1  # No input detected
                         pass  # No input yet
                     except Exception as e:
                         logger.error(f"Input error: {e}")
+                        no_audio_counter += 1
                         time.sleep(0.5)  # Back off
+                    
+                    # Mic watchdog: If no audio detected for 10+ consecutive checks, trigger recovery
+                    if no_audio_counter >= 10:
+                        logger.warning("Mic watchdog: No audio detected for extended period - triggering recovery")
+                        if recover_audio():
+                            logger.info("Audio recovery successful")
+                            no_audio_counter = 0
+                        else:
+                            logger.error("Audio recovery failed")
+                            no_audio_counter = 0  # Reset to prevent spam
         
         except Exception as e:
             logger.error(f"Input thread crashed: {e}")
 
-class StdinThread(threading.Thread):
-    """Allow text input (non-blocking on Pi)"""
+class NotificationPoller(threading.Thread):
+    """Poll backend for proactive notifications"""
     
     def __init__(self, output_queue: queue.Queue):
-        super().__init__(daemon=True, name="StdinThread")
+        super().__init__(daemon=True, name="NotificationPoller")
         self.output_queue = output_queue
         self.running = True
-        self.last_activity = time.time()
+        self.last_poll = 0
+    
+    def run(self):
+        logger.info("[NOTIFICATIONS] Poller started")
+        
+        while self.running:
+            try:
+                now = time.time()
+                if now - self.last_poll >= 60:  # Poll every 60 seconds
+                    self._poll_notifications()
+                    self.last_poll = now
+                
+                time.sleep(10)  # Check every 10s if it's time to poll
+            
+            except Exception as e:
+                logger.error(f"Notification poller error: {e}")
+                time.sleep(30)
+    
+    def _poll_notifications(self):
+        """Poll backend for notifications"""
+        try:
+            resp = requests.get(f"{BACKEND_ENDPOINT}/notifications?user_id={USER_ID}", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                notifications = data.get("notifications", [])
+                for note in notifications:
+                    if isinstance(note, str):
+                        suggestion = note
+                    elif isinstance(note, dict):
+                        suggestion = note.get("content", "")
+                    else:
+                        suggestion = None
+
+                    if suggestion:
+                        logger.info(f"[NOTIFICATION] {suggestion}")
+                        self.output_queue.put((2, ("notification", suggestion)))  # Priority 2
+                        # Mark as read is handled by backend        except Exception as e:
+            logger.debug(f"Notification poll failed: {e}")
     
     def run(self):
         logger.info("[STDIN] Text input ready")
@@ -367,20 +745,20 @@ class StdinThread(threading.Thread):
                         continue
                     
                     if line.lower() == "exit":
-                        self.output_queue.put(("command", "exit"))
+                        self.output_queue.put((3, ("command", "exit")))  # Priority 3: commands
                     elif line.startswith("text:"):
                         text = line[5:].strip()
                         if text:
                             self.last_activity = time.time()
                             logger.info(f"[TEXT] {text}")
-                            self.output_queue.put(("text", text))
+                            self.output_queue.put((2, ("text", text)))  # Priority 2: text
                     elif line.lower() == "/see":
-                        self.output_queue.put(("vision", "see"))
+                        self.output_queue.put((2, ("vision", "see")))  # Priority 2: vision
                     else:
                         # Treat as text
                         self.last_activity = time.time()
                         logger.info(f"[TEXT] {line}")
-                        self.output_queue.put(("text", line))
+                        self.output_queue.put((2, ("text", line)))  # Priority 2: text
                 
                 except EOFError:
                     logger.info("EOF on stdin")
@@ -397,35 +775,39 @@ class StdinThread(threading.Thread):
 # ============================================================================
 
 class OutputThread(threading.Thread):
-    """Handle TTS output (non-blocking via async speak)"""
+    """Handle TTS output with multi-engine cascade"""
     
-    def __init__(self, engine: pyttsx3.TTS, input_queue: queue.Queue):
+    def __init__(self, tts_service: TTSService, input_queue: queue.Queue):
         super().__init__(daemon=True, name="OutputThread")
-        self.engine = engine
+        self.tts_service = tts_service
         self.input_queue = input_queue
         self.running = True
         self.is_speaking = False
         self.last_activity = time.time()
     
     def run(self):
-        if not self.engine:
-            logger.warning("TTS not available - skipping audio output")
-            return
-        
-        logger.info("[OUTPUT] TTS ready")
+        logger.info("[OUTPUT] Multi-engine TTS ready")
         
         while self.running:
             try:
-                text = self.input_queue.get(timeout=2)
+                item = self.input_queue.get(timeout=2)
+                if isinstance(item, tuple) and len(item) == 2:
+                    priority, (msg_type, data) = item
+                    if msg_type == "voice" or msg_type == "notification":
+                        text = data
+                        ai_mode = "ollama"  # Default for suggestions
+                    else:
+                        text, ai_mode = data
+                else:
+                    text, ai_mode = item
                 
                 if text and len(text) > 0:
                     self.is_speaking = True
                     self.last_activity = time.time()
                     
                     try:
-                        logger.info(f"[TTS] Speaking: {text[:40]}...")
-                        self.engine.say(text)
-                        self.engine.runAndWait()
+                        logger.info(f"[TTS] Speaking with mode {ai_mode}: {text[:40]}...")
+                        self.tts_service.speak_response(text, ai_mode)
                     except Exception as e:
                         logger.error(f"TTS playback error: {e}")
                     finally:
@@ -482,16 +864,16 @@ class ORIONHeadlessClient:
         # Initialize subsystems
         init_audio()
         recognizer, mic = init_microphone()
-        engine = init_speaker()
+        tts_service = TTSService()  # Multi-engine TTS
         
         self.recognizer = recognizer
         self.mic = mic
-        self.engine = engine
+        self.tts_service = tts_service
         self.vision = VisionManager() if VISION_AVAILABLE else None
         
-        # Queues
+        # Queues - now priority queue: (priority, (type, data))
         self.input_queue = queue.Queue()      # For TTS output
-        self.user_input_queue = queue.Queue() # For backend input
+        self.user_input_queue = queue.PriorityQueue() # For backend input with priority
         
         # Threads
         self.threads = {}
@@ -502,7 +884,7 @@ class ORIONHeadlessClient:
         logger.info("[CLIENT] Starting threads...")
         
         # Output thread (TTS)
-        output_thread = OutputThread(self.engine, self.input_queue)
+        output_thread = OutputThread(self.tts_service, self.input_queue)
         output_thread.start()
         self.threads['output'] = output_thread
         
@@ -525,6 +907,11 @@ class ORIONHeadlessClient:
         monitor.running = self.running
         monitor.start()
         
+        # Notification poller
+        poller = NotificationPoller(self.input_queue)
+        poller.start()
+        self.threads['poller'] = poller
+        
         print("✓ Text input enabled")
         print("\nCommands:")
         print("  - Speak or type naturally")
@@ -534,13 +921,59 @@ class ORIONHeadlessClient:
         print("=" * 70)
     
     def run(self):
-        """Main processing loop"""
+        """Main processing loop with watchdog monitoring and runtime health checks"""
         self.start()
+        watchdog_timer = 0
+        health_check_timer = 0
+        heartbeat_timer = 0
+        memory_trim_timer = 0
         
         try:
             while self.running:
                 try:
-                    input_type, user_input = self.user_input_queue.get(timeout=1)
+                    current_time = time.time()
+                    
+                    # Heartbeat file every 30 seconds (anti-zombie guard)
+                    if current_time - heartbeat_timer >= 30:
+                        try:
+                            with open("/tmp/orion_heartbeat", "w") as f:
+                                f.write(str(current_time))
+                        except Exception as e:
+                            logger.warning(f"Heartbeat write failed: {e}")
+                        heartbeat_timer = current_time
+                    
+                    # Memory trimmer every 10 minutes (long-run safety)
+                    if current_time - memory_trim_timer >= 600:
+                        gc.collect()
+                        logger.debug("[MEMORY] Garbage collection completed")
+                        memory_trim_timer = current_time
+                    
+                    # Watchdog check every 60 seconds
+                    if current_time - watchdog_timer >= 60:
+                        try:
+                            from orion.core.dev_monitor import check_backend_health
+                            check_backend_health()
+                        except ImportError:
+                            pass  # Dev monitor not available
+                        watchdog_timer = current_time
+                    
+                    # Runtime health check every 5 minutes
+                    if current_time - health_check_timer >= 300:
+                        try:
+                            from orion.core.dev_monitor import perform_runtime_health_check
+                            perform_runtime_health_check()
+                        except ImportError:
+                            pass  # Dev monitor not available
+                        health_check_timer = current_time
+                    
+                    # Adaptive CPU throttling: adjust timeout based on load
+                    try:
+                        load = os.getloadavg()[0] if hasattr(os, 'getloadavg') else 1.0
+                        timeout = 0.2 if load > 2.0 else 0.05
+                    except:
+                        timeout = 0.05  # Default
+                    
+                    priority, (input_type, user_input) = self.user_input_queue.get(timeout=timeout)
                     
                     # Handle commands
                     if input_type == "command":
@@ -554,6 +987,10 @@ class ORIONHeadlessClient:
                     
                     # Handle user input
                     else:
+                        # Interrupt current speech for natural conversation flow
+                        if self.tts_service and hasattr(self.tts_service, 'interrupt'):
+                            self.tts_service.interrupt()
+                        
                         self._handle_input(user_input)
                 
                 except queue.Empty:
@@ -570,20 +1007,25 @@ class ORIONHeadlessClient:
     
     def _handle_input(self, user_input: str):
         """Process user input"""
+        start_time = time.time()
         try:
             image_b64 = None
             if "see" in user_input.lower() and self.vision:
                 image_b64 = self.vision.get_frame_b64()
             
-            response = send_to_backend(user_input, image_b64)
+            response, ai_mode = send_to_backend(user_input, image_b64)
             
-            print(f"\n🤖 ORION: {response}\n")
+            latency = time.time() - start_time
+            logger.info(f"[LATENCY] Input processing: {latency:.2f}s")
             
-            if response and self.engine:
-                self.input_queue.put(response)
+            print(f"\n🤖 ORION ({ai_mode}): {response}\n")
+            
+            if response and self.tts_service:
+                self.input_queue.put((response, ai_mode))
         
         except Exception as e:
-            logger.error(f"Input handling error: {e}")
+            latency = time.time() - start_time
+            logger.error(f"Input handling error after {latency:.2f}s: {e}")
             print(f"Error: {str(e)[:100]}\n")
     
     def _handle_vision(self):

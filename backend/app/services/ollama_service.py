@@ -56,3 +56,35 @@ class OllamaService:
         # We can reuse the logic from GeminiService or put it in a base class/helper
         # For simplicity now, I'll just save the conversation
         self.memory.add_conversation(user_id, prompt, response, permanent=False)
+
+    def classify_memory_item(self, user_input: str) -> str:
+        """Classify a user statement for memory storage."""
+        try:
+            prompt = f"""
+You are a classification assistant. A user statement is provided, and you must classify it as one of exactly: preference, habit, fact, ignore.
+Return exactly one word and nothing else.
+
+Text: \"{user_input.strip()}\"
+"""
+            url = f"{self.base_url}/api/chat"
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "Classify user memory statements for ORION."},
+                    {"role": "user", "content": prompt}
+                ],
+                "stream": False
+            }
+            resp = requests.post(url, json=payload, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                if "choices" in data and len(data["choices"]) > 0:
+                    text = data["choices"][0].get("message", {}).get("content", "").strip().lower()
+                    candidate = text.split()[0] if text else ""
+                    if candidate in {"preference", "habit", "fact", "ignore"}:
+                        return candidate
+            return "ignore"
+        except Exception as e:
+            logger.warn(f"Memory classification failed: {e}")
+            return "ignore"

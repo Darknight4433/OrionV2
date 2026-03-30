@@ -1,53 +1,209 @@
-# 🚀 ORION Raspberry Pi Deployment Guide
+# ORION Production Deployment Guide
+# ==================================
+# Final Real-World Production Lockdown
 
-## Status: PRODUCTION HARDENED
+## 🚀 QUICK DEPLOYMENT
 
-The headless client is now optimized for Raspberry Pi deployment with:
-- ✅ Non-blocking audio pipelines
-- ✅ Thread-safe camera operations
-- ✅ Memory leak prevention
-- ✅ Graceful error recovery
-- ✅ Health monitoring
-
----
-
-## 📋 STEP-BY-STEP DEPLOYMENT
-
-### STEP 1: Prepare Raspberry Pi (30 min)
-
-#### 1.1 Base Installation
+### 1. Copy Service Files
 ```bash
-# Update system
-sudo apt update && sudo apt upgrade -y
-
-# Install Python 3.11+ and dependencies
-sudo apt install -y python3.11 python3.11-venv python3-pip
-sudo apt install -y build-essential libssl-dev libffi-dev python3-dev
+sudo cp orion-backend.service /etc/systemd/system/
+sudo cp orion-client.service /etc/systemd/system/
 ```
 
-#### 1.2 Audio Setup (CRITICAL)
+### 2. Enable & Start Services
 ```bash
-# Install audio packages
-sudo apt install -y alsa-utils pulseaudio
-
-# List audio devices
-aplay -l    # Playback
-arecord -l  # Recording
-
-# Set default card (replace with your card number)
-nano ~/.asoundrc
+sudo systemctl daemon-reload
+sudo systemctl enable orion-backend
+sudo systemctl enable orion-client
+sudo systemctl start orion-backend
+sudo systemctl start orion-client
 ```
 
-Add this for USB audio:
-```
-defaults.ctl.card 2
-defaults.pcm.card 2
-```
-
-#### 1.3 Camera Setup
+### 3. Verify Deployment
 ```bash
-# Enable camera in raspi-config
-sudo raspi-config
+sudo systemctl status orion-backend
+sudo systemctl status orion-client
+journalctl -u orion-backend -f
+journalctl -u orion-client -f
+```
+
+## 🔧 PRODUCTION FEATURES IMPLEMENTED
+
+### ✅ Process Management
+- **systemd services** for auto-start/restart
+- **Separate backend/client** processes
+- **Dependency management** (client requires backend)
+
+### ✅ Watchdog Monitoring
+- **60-second health checks** on backend
+- **Automatic alerts** if backend unresponsive
+- **Silent monitoring** (no spam)
+
+### ✅ CPU/RAM Control
+- **100ms throttling** in all loops
+- **Prevents overheating** on Pi
+- **Memory leak prevention**
+
+### ✅ Network Edge Cases
+- **2-attempt retry** for WiFi drops
+- **1-second delays** between retries
+- **Prevents false AI failovers**
+
+### ✅ Log Rotation
+- **10MB max file size**
+- **3 backup files** retained
+- **Automatic cleanup**
+
+### ✅ Telegram Bot Stability
+- **10-second timeouts** for all operations
+- **Long polling** with proper intervals
+- **Connection recovery**
+
+### ✅ Audio Hardware Recovery
+- **ALSA restart** on audio lock
+- **Pygame reinitialization**
+- **Automatic recovery**
+
+### ✅ Camera Recovery
+- **OpenCV reinitialize** on failure
+- **2-second wait** before retry
+- **Prevents permanent camera crash**
+
+### ✅ Safe Mode Fallback
+- **Backend safe endpoint** (`/safe`)
+- **Intent engine safe mode** response
+- **System never becomes silent**
+
+## 📊 SYSTEM ARCHITECTURE
+
+```
+Raspberry Pi
+├── ORION Backend (uvicorn)
+│   ├── FastAPI server
+│   ├── AI orchestration
+│   ├── Health monitoring
+│   └── Safe mode fallback
+│
+├── ORION Client (headless)
+│   ├── Voice cascade (ElevenLabs → Sarvam → gTTS)
+│   ├── Camera recovery
+│   ├── Audio recovery
+│   └── Watchdog monitoring
+│
+LAN Server
+├── Ollama (primary AI)
+│
+Cloud
+├── Gemini (fallback AI)
+├── ElevenLabs (English TTS)
+├── Sarvam (Indian TTS)
+└── Telegram Bot API
+```
+
+## 🎯 DEPLOYMENT CHECKLIST
+
+### SYSTEM
+- [ ] `sudo systemctl status orion-backend` → active
+- [ ] `sudo systemctl status orion-client` → active
+- [ ] `curl http://localhost:8000/health` → 200 OK
+- [ ] Logs rotating: `ls -la logs/orion.log*`
+
+### AI
+- [ ] Ollama server running on LAN
+- [ ] Gemini API key configured
+- [ ] TinyLlama offline fallback working
+
+### VOICE
+- [ ] ElevenLabs API key configured
+- [ ] Sarvam API keys configured
+- [ ] Audio hardware stable (test playback)
+
+### TELEGRAM
+- [ ] Bot token configured
+- [ ] Dev ID configured
+- [ ] `/health` command works
+
+### HARDWARE
+- [ ] Camera stable (test `/see`)
+- [ ] Microphone stable (test voice input)
+- [ ] Speaker stable (test TTS)
+
+## 🔍 TROUBLESHOOTING
+
+### Backend Not Starting
+```bash
+journalctl -u orion-backend -n 50
+sudo systemctl restart orion-backend
+```
+
+### Client Not Starting
+```bash
+journalctl -u orion-client -n 50
+sudo systemctl restart orion-client
+```
+
+### Audio Issues
+```bash
+sudo systemctl restart alsa-utils
+sudo systemctl restart orion-client
+```
+
+### Camera Issues
+```bash
+# Check camera
+vcgencmd get_camera
+# Restart client
+sudo systemctl restart orion-client
+```
+
+### Network Issues
+```bash
+# Check connectivity
+ping 8.8.8.8
+# Restart services
+sudo systemctl restart orion-backend orion-client
+```
+
+## 🚨 MONITORING
+
+### Real-Time Status
+```bash
+# Backend health
+curl http://localhost:8000/health
+
+# Service status
+sudo systemctl status orion-*
+
+# Logs
+journalctl -u orion-backend -f
+journalctl -u orion-client -f
+```
+
+### Telegram Commands
+- `/health` - System health check
+- `/status` - ORION status
+- `/debug` - Router decisions (dev only)
+
+## 🎉 SUCCESS CRITERIA
+
+When you see:
+- ✅ `orion-backend` active
+- ✅ `orion-client` active
+- ✅ Telegram `/health` shows all systems green
+- ✅ Voice commands work
+- ✅ Camera `/see` works
+
+**ORION is successfully deployed in production!** 🎊
+
+## 🚀 NEXT STEPS
+
+After deployment:
+1. **Performance Optimization** - Reduce latency
+2. **Advanced Features** - Interruption handling, memory AI
+3. **Scaling** - Multi-device support
+4. **Security** - Encrypted communications
+
+**You now have a real AI system running on Raspberry Pi.**
 # → Interface Options → Camera → Enable
 
 # Verify camera
