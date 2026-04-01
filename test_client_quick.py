@@ -5,11 +5,11 @@ ORION Client Quick Test
 Test the new headless client without running the full validation suite.
 
 This verifies:
-  ✓ Backend connectivity
-  ✓ Microphone access
-  ✓ Speaker access
-  ✓ Camera availability (if present)
-  ✓ Client can send/receive messages
+✓ Backend connectivity
+✓ Microphone access
+✓ Speaker access
+✓ Camera availability (if present)
+✓ Client can send/receive messages
 """
 
 import sys

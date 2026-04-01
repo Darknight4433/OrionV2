@@ -13,18 +13,25 @@ except ImportError:
 
 class VisionService:
     def __init__(self):
-        self.client = vision.ImageAnnotatorClient() if vision else None
-        if not self.client:
-            logger.warning("Google Cloud Vision not available. Check installation.")
-            
+        self.client = None
         self.daily_calls = 0
         self.last_call_time = 0
         self.daily_reset_time = time.time()
         self.last_seen_objects = []
+        
+    def _get_client(self):
+        if self.client is None and vision:
+            try:
+                self.client = vision.ImageAnnotatorClient()
+            except Exception as e:
+                logger.warning(f"Failed to initialize Vision client: {e}")
+                self.client = None
+        return self.client
 
     def analyze_image(self, image_data_b64: str) -> str:
         """Analyze a base64 encoded image with cost & quality filters."""
-        if not self.client:
+        client = self._get_client()
+        if not client:
             return "Google Cloud Vision client is not initialized."
 
         now = time.time()
@@ -67,7 +74,8 @@ class VisionService:
             text_detected = ""
             if response.text_annotations:
                 # Get the first text annotation which contains the entire detected text
-                text_detected = f" (Text detected: '{response.text_annotations[0].description.replace('\n', ' ')[:50]}...')"
+                cleaned_text = response.text_annotations[0].description.replace('\n', ' ')
+                text_detected = f" (Text detected: '{cleaned_text[:50]}...')"
                 
             self.last_seen_objects = valid_labels
 

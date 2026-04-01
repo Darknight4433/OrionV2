@@ -93,34 +93,77 @@ class SpeakerService:
         """Generate and queue speech from text with tiered fallback."""
         if not text: return
         
-        # Sentence splitting for faster perceived start time
+        # 🎤 VOICE NATURALITY ENHANCEMENT
+        # Clean response: remove extra newlines, limit to 1-2 sentences
+        text = text.replace('\n', ' ').strip()
+        sentences = text.split('. ')
+        sentences = [s.strip() for s in sentences[:2] if s.strip()]  # Max 1-2 sentences
+        text = '. '.join(sentences)
+        if not text.endswith(('.', '!', '?')):
+            text += '.'
+        
+        # Add slight delay for naturalness (human-like pause before response)
+        time.sleep(0.3)
+        
+        # Sentence splitting for parallel processing
         sentences = [s.strip() for s in re.split(r'(?<=[.!?\n]) +', text) if s.strip()]
         
         for sentence in sentences:
             temp_file = f"temp_speech_{uuid.uuid4().hex}.mp3"
             success = False
+            last_error = None
             
             # Simple language detection for Hindi/Devanagari
             is_hindi = any('\u0900' <= char <= '\u097F' for char in sentence)
             
             if not is_hindi:
                 # Tier 1 (Eng): ElevenLabs
-                success = self.eleven.generate_tts(sentence, temp_file)
-                if success: logger.info("TTS: ElevenLabs (English) success.")
+                try:
+                    success = self.eleven.generate_tts(sentence, temp_file)
+                    if success: 
+                        logger.info("TTS: ElevenLabs (English) success.")
+                except Exception as e:
+                    last_error = str(e)
+                    if "429" in last_error or "rate limit" in last_error.lower():
+                        logger.warn("TTS: ElevenLabs API limit reached")
+                    elif "timeout" in last_error.lower() or "connection" in last_error.lower():
+                        logger.warn("TTS: ElevenLabs network timeout")
+                    else:
+                        logger.error(f"TTS: ElevenLabs error: {e}")
                 
                 # Tier 2 (Eng): Sarvam (Priya voice)
                 if not success:
-                    success = self.sarvam.generate_tts(sentence, temp_file)
-                    if success: logger.info("TTS: Sarvam (English Fallback) success.")
+                    try:
+                        success = self.sarvam.generate_tts(sentence, temp_file)
+                        if success: 
+                            logger.info("TTS: Sarvam (English Fallback) success.")
+                    except Exception as e:
+                        last_error = str(e)
+                        if "401" in last_error or "auth" in last_error.lower():
+                            logger.warn("TTS: Sarvam authentication failure")
+                        elif "timeout" in last_error.lower():
+                            logger.warn("TTS: Sarvam network timeout")
+                        else:
+                            logger.error(f"TTS: Sarvam error: {e}")
             else:
                 # Tier 1 (Hin): Sarvam
-                success = self.sarvam.generate_tts(sentence, temp_file)
-                if success: logger.info("TTS: Sarvam (Hindi) success.")
+                try:
+                    success = self.sarvam.generate_tts(sentence, temp_file)
+                    if success: 
+                        logger.info("TTS: Sarvam (Hindi) success.")
+                except Exception as e:
+                    last_error = str(e)
+                    logger.error(f"TTS: Sarvam Hindi error: {e}")
                 
                 # Tier 2 (Hin): ElevenLabs (Might sound accented but works)
                 if not success:
-                    success = self.eleven.generate_tts(sentence, temp_file)
-                    if success: logger.info("TTS: ElevenLabs (Hindi Fallback) success.")
+                    try:
+                        success = self.eleven.generate_tts(sentence, temp_file)
+                        if success: 
+                            logger.info("TTS: ElevenLabs (Hindi Fallback) success.")
+                    except Exception as e:
+                        last_error = str(e)
+                        logger.error(f"TTS: ElevenLabs Hindi error: {e}")
 
             # Tier 3: gTTS (Last Resort)
             if not success:
@@ -131,9 +174,18 @@ class SpeakerService:
                     logger.info("TTS: gTTS generation success (Emergency Fallback).")
                 except Exception as e:
                     logger.error(f"TTS: Final gTTS fallback failed: {e}")
+                    # One last attempt: log and continue (don't break entire response)
+                    if os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                        except:
+                            pass
+                    continue
 
             if success:
                 self.playback_queue.put(temp_file)
+            else:
+                logger.error(f"TTS: All backends failed for sentence (will skip): {sentence[:50]}")
 
     def stop(self):
         voice_state.stop_requested = True

@@ -16,7 +16,7 @@ logger.add("logs/orion_errors.log", rotation="20 MB", retention="90 days", level
 # --- ALSA/PortAudio Silencer ---
 def silence_alsa():
     if os.name == 'posix': # Linux/Pi
-        try:
+        try:    
             from ctypes import cdll, CFUNCTYPE, c_char_p, c_int
             
             # Define error handler callback

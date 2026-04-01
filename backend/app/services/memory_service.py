@@ -1,8 +1,8 @@
 import sqlite3
 import time
 import os
-from .config import settings, PROJECT_ROOT
-from .logging import get_logger
+from ..core.config import settings, PROJECT_ROOT
+from ..core.logging import get_logger
 
 logger = get_logger()
 
@@ -264,6 +264,30 @@ class MemoryService:
         except Exception:
             return []
 
+    def cleanup_conversations(self, user_id: str, keep_count: int = 20):
+        """
+        🧹 PHASE 2 OPTIMIZATION: Keep only last N conversations for memory efficiency.
+        Prevents DB bloat after heavy usage.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                # Get total conversation count
+                cursor.execute("SELECT COUNT(*) FROM conversation_history WHERE user_id = ?", (user_id,))
+                total = cursor.fetchone()[0]
+                
+                if total > keep_count:
+                    # Delete oldest conversations, keep recent ones
+                    cursor.execute(
+                        "DELETE FROM conversation_history WHERE user_id = ? AND id NOT IN (SELECT id FROM conversation_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?)",
+                        (user_id, user_id, keep_count)
+                    )
+                    deleted = total - keep_count
+                    logger.info(f"Memory cleanup: removed {deleted} old conversations for {user_id}")
+                    conn.commit()
+        except Exception as e:
+            logger.error(f"Cleanup Conversations Error: {e}")
+
     def run_maintenance(self):
         """The Janitor: Cleans old logs and optimizes DB."""
         try:
@@ -273,6 +297,9 @@ class MemoryService:
                 conn.execute("DELETE FROM conversation_history WHERE timestamp < ? AND permanent = 0", (cutoff,))
                 conn.execute("VACUUM")
                 logger.info("Memory Janitor finished maintenance.")
+            
+            # 🧹 PHASE 2: Keep only last 20 conversations to prevent memory bloat
+            self.cleanup_conversations("default_user", keep_count=20)
         except Exception as e:
             logger.error(f"Maintenance Error: {e}")
 

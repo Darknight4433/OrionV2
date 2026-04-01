@@ -5,26 +5,41 @@ import time
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.core.intent_engine import IntentEngine
-from app.services.memory_service import MemoryService
-from app.services.gemini_service import GeminiService
-from app.services.ollama_service import OllamaService
-from app.services.browser_service import BrowserService
-from app.services.greeting_service import GreetingService
-from app.services.vision_service import VisionService
-from app.services.habit_suggester import HabitSuggester
-from app.services.decision_engine import DecisionEngine
-from app.core.config import settings
-from app.core.logging import get_logger
-from app.api import monitoring
+from .core.intent_engine import IntentEngine
+from .services.memory_service import MemoryService
+from .services.gemini_service import GeminiService
+from .services.ollama_service import OllamaService
+from .services.browser_service import BrowserService
+from .services.greeting_service import GreetingService
+from .services.vision_service import VisionService
+from .services.habit_service import HabitDetector
+from .services.habit_suggester import HabitSuggester
+from .services.decision_engine import DecisionEngine
+from .services.planner_engine import PlannerEngine
+from .services.briefing_engine import BriefingEngine
+from .core.config import settings
+from .core.logging import get_logger
+from .api import monitoring
 
-from app.core.logging import get_logger
-from app.api import monitoring
-from app.core.lifecycle import LifecycleManager
+from .core.logging import get_logger
+from .api import monitoring
+from .core.lifecycle import LifecycleManager
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
 logger = get_logger()
+
+# send one alert text per interval to avoid user spam
+last_action_sent = {}  # {text: timestamp}
+
+
+def should_send_notification(text: str, cooldown_sec: int = 300) -> bool:
+    now = time.time()
+    if text in last_action_sent and now - last_action_sent[text] < cooldown_sec:
+        return False
+    last_action_sent[text] = now
+    return True
+
 
 app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
 
@@ -76,6 +91,10 @@ browser_service = BrowserService()
 vision_service = VisionService()
 habit_detector = HabitDetector(memory_service)
 habit_suggester = HabitSuggester(memory_service)
+greeting_service = GreetingService(memory_service)
+decision_engine = DecisionEngine(memory_service, habit_suggester)
+planner_engine = PlannerEngine()
+briefing_engine = BriefingEngine(memory_service)
 intent_engine = IntentEngine(
     gemini_service,
     ollama_service,
@@ -83,10 +102,9 @@ intent_engine = IntentEngine(
     browser_service,
     vision_service,
     habit_detector,
-    habit_suggester
+    habit_suggester,
+    briefing_engine
 )
-greeting_service = GreetingService(memory_service)
-decision_engine = DecisionEngine(memory_service, habit_suggester)
 
 # Proactive Scheduler
 scheduler = AsyncIOScheduler()
@@ -116,7 +134,7 @@ async def check_habit_suggestions():
 
 
 async def check_best_action():
-    """Decision engine poll: choose top candidate and notify."""
+    """Decision engine poll: choose top candidate, expand with planner, and notify."""
     user_id = "default_user"
     last_active = memory_service.get_last_activity(user_id)
     if last_active and time.time() - last_active < 30:
@@ -124,9 +142,23 @@ async def check_best_action():
 
     action = decision_engine.choose_best_action(user_id, last_input_time=last_active, last_output_time=None)
     if action:
-        # We want one clear notification, not multiple
-        memory_service.add_system_alert(user_id, action["text"], "decision")
-        logger.info(f"Decision action sent: {action['type']} - {action['text']}")
+        # Expand action with planner context
+        planned_action = planner_engine.build_plan(action, memory_service)
+        
+        if should_send_notification(planned_action["text"]):
+            # Send expanded plan instead of raw action
+            memory_service.add_system_alert(user_id, planned_action["text"], "decision")
+            logger.info(f"Decision action sent (planned): {planned_action['type']} - {planned_action['text']}")
+        else:
+            logger.info(f"Decision action skipped as duplicate/recent: {planned_action['text']}")
+
+
+async def morning_briefing():
+    """Send morning briefing at 8:00 AM daily."""
+    user_id = "default_user"
+    briefing = briefing_engine.get_morning_briefing(user_id)
+    memory_service.add_system_alert(user_id, briefing, "briefing")
+    logger.info(f"Morning briefing sent: {briefing}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -145,8 +177,64 @@ async def startup_event():
     from apscheduler.triggers.cron import CronTrigger
     scheduler.add_job(memory_service.run_maintenance, CronTrigger(hour=3, minute=0))
     
+    # Morning Briefing - Runs at 8:00 AM daily
+    scheduler.add_job(morning_briefing, CronTrigger(hour=8, minute=0))
+    
+    # ================== PHASE 3: REAL-WORLD HARDENING ==================
+    # Daily Health Check at 6 AM
+    async def daily_health_check_job():
+        from .services.health_monitor import get_health_monitor
+        from .services.usage_monitor import get_monitor
+        from .services.auto_recovery import auto_recovery_check
+        
+        monitor = get_health_monitor()
+        usage_stats = get_monitor().stats
+        health_status = monitor.run_full_health_check(usage_stats)
+        
+        # If issues found, trigger recovery
+        if not health_status["healthy"]:
+            logger.warning(f"🚨 Health check found issues: {health_status['alerts']}")
+            recovery_result = auto_recovery_check(health_status)
+            if recovery_result["recovered"]:
+                logger.info(f"✅ Auto-recovery executed: {recovery_result['actions_taken']}")
+    
+    # Auto-recovery check every 30 minutes
+    async def periodic_auto_recovery():
+        from .services.health_monitor import get_health_monitor
+        from .services.usage_monitor import get_monitor
+        from .services.auto_recovery import auto_recovery_check
+        
+        monitor = get_health_monitor()
+        usage_stats = get_monitor().stats
+        health_status = monitor.run_full_health_check(usage_stats)
+        
+        if not health_status["healthy"]:
+            auto_recovery_check(health_status)
+    
+    # Weekly maintenance on Sunday at 2 AM
+    async def weekly_maintenance_job():
+        from .services.weekly_maintenance import weekly_maintenance_check
+        result = weekly_maintenance_check()
+        if result["executed"]:
+            logger.info("✅ Weekly maintenance executed")
+    
+    # Usage learning summary every 6 hours
+    async def usage_learning_job():
+        from .services.usage_learner import get_learner
+        learner = get_learner()
+        summary = learner.get_learning_summary()
+        logger.info(f"📚 Usage patterns updated: {summary}")
+    
+    scheduler.add_job(daily_health_check_job, CronTrigger(hour=6, minute=0))
+    scheduler.add_job(periodic_auto_recovery, IntervalTrigger(minutes=30))
+    scheduler.add_job(weekly_maintenance_job, CronTrigger(day_of_week=6, hour=2, minute=0))  # Sunday 2 AM
+    scheduler.add_job(usage_learning_job, IntervalTrigger(hours=6))
+    
+    logger.info("✅ Phase 3 Real-World Hardening scheduled")
+    # ===================================================================
+    
     scheduler.start()
-    logger.info("Scheduler started (Poller + Janitor).")
+    logger.info("Scheduler started (Poller + Janitor + Daily Briefing + Phase 3 Hardening).")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -182,6 +270,12 @@ async def get_notifications(user_id: str = "default_user"):
     if alerts:
         logger.info(f"Serving {len(alerts)} alerts to {user_id}")
     return NotificationResponse(notifications=alerts)
+
+@app.get("/schedule")
+async def get_schedule(user_id: str = "default_user"):
+    """Get current day's schedule and pending tasks (Sir asks: What's my schedule?)."""
+    briefing = briefing_engine.get_context_briefing(user_id)
+    return {"schedule": briefing}
 
 @app.post("/voice")
 async def voice_endpoint(file: UploadFile = File(...), user_id: str = Form(...)):

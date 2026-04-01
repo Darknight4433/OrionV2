@@ -10,6 +10,7 @@ from ..services.browser_service import BrowserService
 from ..services.vision_service import VisionService
 from ..services.habit_service import HabitDetector
 from ..services.habit_suggester import HabitSuggester
+from ..services.briefing_engine import BriefingEngine
 from ..core.security_models import PermissionMatrix
 
 class IntentEngine:
@@ -20,7 +21,8 @@ class IntentEngine:
                  browser_service: BrowserService,
                  vision_service: VisionService = None,
                  habit_detector: HabitDetector = None,
-                 habit_suggester: HabitSuggester = None):
+                 habit_suggester: HabitSuggester = None,
+                 briefing_engine: BriefingEngine = None):
         self.gemini = gemini_service
         self.ollama = ollama_service
         self.memory = memory_service
@@ -28,6 +30,7 @@ class IntentEngine:
         self.vision = vision_service
         self.habit_detector = habit_detector
         self.habit_suggester = habit_suggester
+        self.briefing_engine = briefing_engine
         
         # OMNIS_5 Fillers (professional)
         self.fillers = [
@@ -52,6 +55,7 @@ class IntentEngine:
             (r'time check|what time is it', self._handle_time_check),
             (r'search for (.+)', self._handle_web_search),
             (r'(?:create|add) (?:a )?task (.+)', self._handle_add_task),
+            (r"what'?s my schedule|what'?s today|show.*schedule|any.*meeting|pending.*task", self._handle_schedule_query),
         ]
         
         # Preference patterns to extract and store
@@ -157,7 +161,7 @@ class IntentEngine:
             
             # Try Ollama (Primary)
             try:
-                ollama_prompt = f"System: You are ORION, a professional AI executive assistant for Sir. {enhanced_context}\n\nINSTRUCTIONS: Be respectful, concise, and helpful. Address as 'Sir'. Focus on school administration, meetings, tasks, and study habits. Provide clear, professional responses. Keep explanations brief.\n\nUser: {q}"
+                ollama_prompt = f"System: You are ORION, a professional AI executive assistant for Sir. {enhanced_context}\n\nINSTRUCTIONS: Be respectful, concise, and helpful. Address as 'Sir'. Focus on school administration, meetings, tasks, and study habits. Provide clear, professional responses. Keep explanations brief. ALWAYS maintain a calm, respectful, and professional tone - never casual, chatty, or playful.\n\nUser: {q}"
                 for chunk in self.ollama.get_response_stream(uid, ollama_prompt):
                     if chunk.startswith("SYSTEM ERROR"):
                         fallback_needed = True
@@ -185,7 +189,7 @@ class IntentEngine:
                 full_resp = "" # Reset response
                 if stream_cb: stream_cb("\n[System: Checking cloud for updated info...]\n")
                 
-                full_q = f"You are ORION, a professional AI executive assistant for Sir. {enhanced_context}\n\nINSTRUCTIONS: Be respectful, concise, and helpful. Address as 'Sir'. Focus on school administration, meetings, tasks, and study habits. Provide clear, professional responses. Keep explanations brief.\n\nUser: {q}"
+                full_q = f"You are ORION, a professional AI executive assistant for Sir. {enhanced_context}\n\nINSTRUCTIONS: Be respectful, concise, and helpful. Address as 'Sir'. Focus on school administration, meetings, tasks, and study habits. Provide clear, professional responses. Keep explanations brief. ALWAYS maintain a calm, respectful, and professional tone - never casual, chatty, or playful.\n\nUser: {q}"
                 for chunk in self.gemini.get_response_stream(uid, full_q):
                     clean_chunk = self._clean_response(chunk)
                     if clean_chunk:
@@ -200,7 +204,9 @@ class IntentEngine:
             else:
                 return await run_llm(user_id, text, None)
         except Exception as e:
-            return "System is running in safe mode. Basic functions only.", "safe"
+            # 🛡️ PHASE 2: Never stay silent - always respond with fail-safe message
+            logger.error(f"Intent Engine critical error: {e}")
+            return "I am currently unable to process that request, Sir. Please try again or contact support.", "safe"
 
     async def _handle_add_meeting(self, user_id, match):
         details = match.group(1)
@@ -211,6 +217,12 @@ class IntentEngine:
         details = match.group(1)
         self.memory.add_task(details, user_id)
         return f"Task added to your list: {details}"
+
+    async def _handle_schedule_query(self, user_id, match):
+        """Handle 'What's my schedule?' or similar queries."""
+        if self.briefing_engine:
+            return self.briefing_engine.get_context_briefing(user_id)
+        return "I cannot retrieve your schedule at this moment."
 
     async def _process_memory(self, user_id: str, text: str) -> str:
         """3-layer memory process: rule, classifier, storage."""

@@ -1,0 +1,15 @@
+{
+  "last_check": "2026-04-01T20:02:21.667706",
+  "response_time_avg": 0.0,
+  "error_rate": 0.0,
+  "memory_usage_mb": 34.625,
+  "service_status": {
+    "voice": "healthy",
+    "memory": "healthy",
+    "ollama": "error",
+    "gemini": "unknown"
+  },
+  "alerts": [
+    "Ollama server down"
+  ]
+}

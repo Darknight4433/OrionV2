@@ -1,0 +1,11 @@
+{
+  "command_shortcuts": {
+    "test": "action"
+  },
+  "ignored_suggestions": [],
+  "preferred_length": "short",
+  "repeat_commands": {},
+  "preferred_tone": "formal",
+  "query_patterns": {},
+  "learned_at": "2026-04-01T20:02:11.761116"
+}

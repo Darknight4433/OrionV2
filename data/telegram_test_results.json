@@ -1,0 +1,150 @@
+{
+  "timestamp": "2026-04-01T20:50:33.455017",
+  "total_tests": 19,
+  "passed": 16,
+  "success_rate": 84.21052631578947,
+  "phases": {
+    "1": true,
+    "2": false,
+    "3": false,
+    "4": true,
+    "5": true,
+    "6": true,
+    "7": true
+  },
+  "details": [
+    {
+      "phase": 1,
+      "test": "/start returns response",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:02.625216",
+      "details": ""
+    },
+    {
+      "phase": 1,
+      "test": "/status command works",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:04.512128",
+      "details": ""
+    },
+    {
+      "phase": 1,
+      "test": "Bot responds to natural language",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:09.513833",
+      "details": ""
+    },
+    {
+      "phase": 2,
+      "test": "/today executes instantly",
+      "passed": false,
+      "timestamp": "2026-04-01T20:50:10.627524",
+      "details": "1.11s"
+    },
+    {
+      "phase": 2,
+      "test": "/status executes instantly",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:11.441562",
+      "details": "0.81s"
+    },
+    {
+      "phase": 2,
+      "test": "/health command works",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:12.299536",
+      "details": ""
+    },
+    {
+      "phase": 2,
+      "test": "/add task executes instantly",
+      "passed": false,
+      "timestamp": "2026-04-01T20:50:13.402566",
+      "details": "1.10s"
+    },
+    {
+      "phase": 3,
+      "test": "Task addition command works",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:14.290605",
+      "details": ""
+    },
+    {
+      "phase": 3,
+      "test": "Task appears in /today list",
+      "passed": false,
+      "timestamp": "2026-04-01T20:50:20.218457",
+      "details": ""
+    },
+    {
+      "phase": 4,
+      "test": "/see command executes",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:21.428295",
+      "details": ""
+    },
+    {
+      "phase": 4,
+      "test": "Cooldown logic implemented",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:21.428295",
+      "details": "Test manually"
+    },
+    {
+      "phase": 5,
+      "test": "/dnd on enables do-not-disturb",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:22.354031",
+      "details": ""
+    },
+    {
+      "phase": 5,
+      "test": "/status shows DND",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:24.291588",
+      "details": ""
+    },
+    {
+      "phase": 5,
+      "test": "/dnd off restores normal",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:25.239523",
+      "details": ""
+    },
+    {
+      "phase": 5,
+      "test": "Natural conversation transitions to ENGAGED",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:29.753142",
+      "details": ""
+    },
+    {
+      "phase": 6,
+      "test": "Bot survives network issues",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:30.702938",
+      "details": ""
+    },
+    {
+      "phase": 6,
+      "test": "System commands work during outage",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:31.626859",
+      "details": ""
+    },
+    {
+      "phase": 6,
+      "test": "Scheduler independent of AI",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:32.589555",
+      "details": ""
+    },
+    {
+      "phase": 7,
+      "test": "/debug command works",
+      "passed": true,
+      "timestamp": "2026-04-01T20:50:33.438283",
+      "details": ""
+    }
+  ]
+}
