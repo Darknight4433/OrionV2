@@ -216,33 +216,42 @@ class SpeakerThread(QThread):
             except queue.Empty:
                 continue
 
-            # Split long text for faster first-word
-            sentences = split_sentences(full_text) if len(full_text) > 100 else [full_text]
+            if not full_text.strip():
+                continue
 
-            for sentence in sentences:
-                if not self.running:
-                    break
+            self.status_changed.emit("SPEAKING")
 
-                self.status_changed.emit("SPEAKING")
-                
-                # Language detection: simple check for Hindi/Devanagari characters
-                is_hindi = any('\u0900' <= char <= '\u097F' for char in sentence)
-                
-                spoken = False
+            # Language detection
+            is_hindi = any('\u0900' <= char <= '\u097F' for char in full_text)
 
-                # Only try cloud TTS if keys are actually configured
-                # This avoids wasting time on failed API calls when running locally
-                if not is_hindi and self.eleven_api_key:
-                    spoken = self._speak_elevenlabs(sentence)
+            spoken = False
 
-                if not spoken and self.sarvam_client:
-                    spoken = self._speak_sarvam(sentence)
+            if not is_hindi and self.eleven_api_key:
+                # ElevenLabs: split into sentences for lower latency
+                sentences = split_sentences(full_text) if len(full_text) > 100 else [full_text]
+                all_spoken = True
+                for sentence in sentences:
+                    if not self._speak_elevenlabs(sentence):
+                        all_spoken = False
+                        break
+                spoken = all_spoken
 
-                # Always fall through to offline immediately if no keys
-                if not spoken:
-                    self._speak_offline(sentence)
+            if not spoken and self.sarvam_client:
+                sentences = split_sentences(full_text) if len(full_text) > 100 else [full_text]
+                all_spoken = True
+                for sentence in sentences:
+                    if not self._speak_sarvam(sentence):
+                        all_spoken = False
+                        break
+                spoken = all_spoken
 
-                time.sleep(0.08)  # natural pause
+            if not spoken:
+                # pyttsx3: speak the WHOLE text in ONE runAndWait call
+                # Splitting causes Windows SAPI to cut off after first chunk
+                self._speak_offline(full_text)
+
+            self.status_changed.emit("IDLE")
+            self.queue.task_done()
 
             self.status_changed.emit("IDLE")
             self.queue.task_done()
@@ -1093,42 +1102,25 @@ class OrionDashboard(QMainWindow):
         self.ws.send_chat(text)
 
     def _on_token_received(self, token):
-        """Handle individual streaming tokens — accumulate into sentences for TTS."""
+        """Accumulate streaming tokens — speak when we have a full sentence."""
         if not hasattr(self, '_token_buffer'):
             self._token_buffer = ""
-
         self._token_buffer += token
-
-        # Speak whenever we hit a sentence boundary
-        parts = re.split(r'(?<=[.!?\n]) ', self._token_buffer)
-        if len(parts) > 1:
-            for sentence in parts[:-1]:
-                clean = sentence.strip()
-                if clean and not clean.startswith("["):
-                    self.speaker.say(clean, priority=PRIORITY_RESPONSE)
-                    self._log("ORION", clean, "#34D399")
-            self._token_buffer = parts[-1]
+        # Don't speak yet — wait for _on_response_done to flush the full text
 
     def _on_response_done(self, full_text):
-        """Called when streaming is complete — flush any remaining buffer, no re-speak."""
+        """Streaming complete — speak the full response in one call."""
         self._on_status("IDLE")
-        if hasattr(self, '_token_buffer') and self._token_buffer.strip():
-            leftover = self._token_buffer.strip()
-            if not leftover.startswith("["):
-                self.speaker.say(leftover, priority=PRIORITY_RESPONSE)
-                self._log("ORION", leftover, "#34D399")
-            self._token_buffer = ""
+        self._token_buffer = ""  # clear buffer
+        if full_text.strip() and not full_text.strip().startswith("["):
+            self._log("ORION", full_text.strip(), "#34D399")
+            self.speaker.say(full_text.strip(), priority=PRIORITY_RESPONSE)
 
     def _on_ai_response(self, text):
-        """Called when full response or greeting arrives (not streaming tokens)."""
+        """Called for greetings and direct responses — speak the whole thing at once."""
         self._on_status("IDLE")
-
-        # Flush any leftover token buffer first
-        if hasattr(self, '_token_buffer') and self._token_buffer.strip():
-            leftover = self._token_buffer.strip()
-            if not leftover.startswith("["):
-                self.speaker.say(leftover, priority=PRIORITY_RESPONSE)
-            self._token_buffer = ""
+        if not text.strip():
+            return
 
         if text.startswith("SYSTEM"):
             msg = text.replace("SYSTEM:", "").replace("SYSTEM CRITICAL:", "").strip()
@@ -1137,10 +1129,7 @@ class OrionDashboard(QMainWindow):
             return
 
         self._log("ORION", text, "#34D399")
-        # Only speak if this isn't already covered by token streaming
-        # Greetings arrive here directly (not via tokens) so always speak them
-        if text.strip():
-            self.speaker.say(text, priority=PRIORITY_RESPONSE)
+        self.speaker.say(text, priority=PRIORITY_RESPONSE)
 
     def _log(self, sender, text, color):
         """Append a formatted message to the COMMS LOG panel."""
