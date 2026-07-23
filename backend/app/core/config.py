@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     
     # Ollama Configuration — PRIMARY AI (runs locally)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "gemma3"
+    OLLAMA_MODEL: str = "gemma3:4b"
 
     # Gemini Configuration — FALLBACK only (cloud, when Ollama is down)
     GEMINI_API_KEYS: list[str] = []

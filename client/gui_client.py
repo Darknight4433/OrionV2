@@ -132,9 +132,9 @@ class SpeakerThread(QThread):
 
     def __init__(self):
         super().__init__()
-        # Offline fallback
+        # Offline fallback — used directly when no Sarvam/ElevenLabs keys set
         self.offline_engine = pyttsx3.init()
-        self.offline_engine.setProperty('rate', 165)
+        self.offline_engine.setProperty('rate', 185)  # 185 = natural pace, 165 is too slow
         
         # Try to find a better offline voice (like Zira or Hazel)
         voices = self.offline_engine.getProperty('voices')
@@ -229,14 +229,16 @@ class SpeakerThread(QThread):
                 is_hindi = any('\u0900' <= char <= '\u097F' for char in sentence)
                 
                 spoken = False
+
+                # Only try cloud TTS if keys are actually configured
+                # This avoids wasting time on failed API calls when running locally
                 if not is_hindi and self.eleven_api_key:
-                    # English text -> ElevenLabs first
                     spoken = self._speak_elevenlabs(sentence)
-                
-                if not spoken:
-                    # Hindi text or ElevenLabs failure -> Sarvam (priya voice)
+
+                if not spoken and self.sarvam_client:
                     spoken = self._speak_sarvam(sentence)
-                
+
+                # Always fall through to offline immediately if no keys
                 if not spoken:
                     self._speak_offline(sentence)
 
@@ -321,8 +323,7 @@ class SpeakerThread(QThread):
             return False
 
     def _speak_offline(self, text):
-        """pyttsx3 fallback for when no API keys work."""
-        print("[TTS] Falling back to offline voice.")
+        """pyttsx3 fallback — used directly when no API keys configured."""
         try:
             self.offline_engine.say(text)
             self.offline_engine.runAndWait()
