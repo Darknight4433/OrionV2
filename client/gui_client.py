@@ -32,8 +32,9 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 API_URL = os.environ.get("ORION_API_URL", "http://localhost:8000")
 ENCODINGS_FILE = os.path.join(PROJECT_ROOT, "data", "encoded_file.p")
-# Pull from env if exists, else match the higher tolerance recommended for webcam
-MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", 0.55))
+# Stricter threshold = fewer false matches. 0.42 works well for webcam at close range.
+# Lower = stricter. If too many UNKNOWN, increase slightly. If wrong person, decrease.
+MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", "0.42"))
 
 
 def parse_env_list(key):
@@ -835,10 +836,18 @@ class OrionDashboard(QMainWindow):
             self.last_seen_time = now
 
             # ── Stabilize primary user identity (for WS user_id) ──
+            # Buffer last 10 detections — require >60% agreement before confirming
             self._name_buffer.append(names[0])
-            if len(self._name_buffer) > 5:
+            if len(self._name_buffer) > 10:
                 self._name_buffer.pop(0)
-            stable_primary = max(set(self._name_buffer), key=self._name_buffer.count)
+
+            # Only confirm identity if one name appears in >60% of recent frames
+            name_counts = {}
+            for n in self._name_buffer:
+                name_counts[n] = name_counts.get(n, 0) + 1
+            top_name = max(name_counts, key=name_counts.get)
+            top_count = name_counts[top_name]
+            stable_primary = top_name if top_count / len(self._name_buffer) > 0.6 else "UNKNOWN"
             if stable_primary != "UNKNOWN":
                 self.current_user = stable_primary
                 self.ws.update_user(stable_primary)
