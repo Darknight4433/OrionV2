@@ -132,7 +132,7 @@ class AIManager:
         else:
             chain = self._get_provider_chain(complexity)
 
-        full_prompt = f"{system_context}\n{prompt}" if system_context else prompt
+        full_prompt = prompt  # system_context passed separately to each provider
 
         for provider in chain:
             if not self.health[provider].is_ready():
@@ -144,7 +144,7 @@ class AIManager:
                 token_count = 0
                 got_response = False
 
-                async for chunk in self._call_provider(provider, user_id, full_prompt):
+                async for chunk in self._call_provider(provider, user_id, full_prompt, system_context):
                     got_response = True
                     token_count += 1
                     yield chunk
@@ -195,47 +195,25 @@ class AIManager:
     # ──────────────────────────────────────────
 
     async def _call_provider(
-        self, provider: AIProvider, user_id: str, prompt: str
+        self, provider: AIProvider, user_id: str, prompt: str, system_context: str = ""
     ) -> AsyncGenerator[str, None]:
         """Dispatch to the correct provider's streaming implementation."""
         if provider == AIProvider.LOCAL:
-            async for chunk in self._stream_ollama(prompt):
+            async for chunk in self._stream_ollama(prompt, system_context):
                 yield chunk
         elif provider == AIProvider.GEMINI:
-            async for chunk in self._stream_gemini(prompt):
+            async for chunk in self._stream_gemini(prompt, system_context):
                 yield chunk
 
     # ── Ollama (Local) ──
 
-    async def _stream_ollama(self, prompt: str) -> AsyncGenerator[str, None]:
-        """
-        Stream from local Ollama instance.
-        TinyLlama uses chatml format:
-          <|system|>...</s><|user|>...</s><|assistant|>
-        We split the prompt into system + user parts automatically.
-        """
+    async def _stream_ollama(self, prompt: str, system_context: str = "") -> AsyncGenerator[str, None]:
         url = f"{self.ollama_url}/api/chat"
 
-        # The generate() method prepends system_context with a "\n" separator:
-        #   full_prompt = f"{system_context}\n{prompt}"
-        # We split on the LAST newline to separate system context from the user query.
-        # This correctly handles multi-line system context (which contains many \n).
-        sep = "\n"
-        split_idx = prompt.rfind(sep)
-        if split_idx != -1:
-            system_part = prompt[:split_idx].strip()
-            user_part = prompt[split_idx + 1:].strip()
-        else:
-            system_part = ""
-            user_part = prompt.strip()
-
-        if system_part:
-            messages = [
-                {"role": "system", "content": system_part},
-                {"role": "user",   "content": user_part}
-            ]
-        else:
-            messages = [{"role": "user", "content": user_part}]
+        messages = []
+        if system_context:
+            messages.append({"role": "system", "content": system_context})
+        messages.append({"role": "user", "content": prompt})
 
         # Context window: smaller = faster first token
         # phi3 supports 4096, but 1024 is much faster for responses
@@ -272,8 +250,8 @@ class AIManager:
 
     # ── Gemini (Cloud Primary) ──
 
-    async def _stream_gemini(self, prompt: str) -> AsyncGenerator[str, None]:
-        """Stream from Google Gemini with key rotation."""
+    async def _stream_gemini(self, prompt: str, system_context: str = "") -> AsyncGenerator[str, None]:
+        """Stream from Google Gemini using system_instruction for clean separation."""
         if not self.gemini_keys:
             raise RuntimeError("No Gemini API keys configured")
 
@@ -286,7 +264,11 @@ class AIManager:
                 genai.configure(api_key=key)
 
                 model_name = self._discover_gemini_model()
-                model = genai.GenerativeModel(model_name)
+                # Pass system context via system_instruction — keeps it out of response
+                model = genai.GenerativeModel(
+                    model_name,
+                    system_instruction=system_context if system_context else None
+                )
 
                 # Run blocking Gemini call in thread pool
                 loop = asyncio.get_event_loop()
