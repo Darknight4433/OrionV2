@@ -676,8 +676,8 @@ class OrionDashboard(QMainWindow):
         # ── WebSocket Connection to Pi 4 Brain ──
         self.ws = OrionWebSocketThread(self.current_user)
         self.ws.token_received.connect(self._on_token_received)
-        self.ws.response_received.connect(self._on_ai_response)
-        self.ws.greeting_received.connect(self._on_ai_response)
+        self.ws.response_received.connect(self._on_response_done)  # just flushes, no re-speak
+        self.ws.greeting_received.connect(self._on_ai_response)    # greetings always speak
         self.ws.alert_received.connect(self._on_notification)
         self.ws.status_changed.connect(self._on_ws_status)
         self.ws.error_occurred.connect(lambda e: self._log("ERR", e, "#F87171"))
@@ -1092,38 +1092,55 @@ class OrionDashboard(QMainWindow):
         self.ws.update_user(self.current_user)
         self.ws.send_chat(text)
 
-    def _on_ai_response(self, text):
+    def _on_token_received(self, token):
+        """Handle individual streaming tokens — accumulate into sentences for TTS."""
+        if not hasattr(self, '_token_buffer'):
+            self._token_buffer = ""
+
+        self._token_buffer += token
+
+        # Speak whenever we hit a sentence boundary
+        parts = re.split(r'(?<=[.!?\n]) ', self._token_buffer)
+        if len(parts) > 1:
+            for sentence in parts[:-1]:
+                clean = sentence.strip()
+                if clean and not clean.startswith("["):
+                    self.speaker.say(clean, priority=PRIORITY_RESPONSE)
+                    self._log("ORION", clean, "#34D399")
+            self._token_buffer = parts[-1]
+
+    def _on_response_done(self, full_text):
+        """Called when streaming is complete — flush any remaining buffer, no re-speak."""
         self._on_status("IDLE")
-        
-        # Style SYSTEM messages differently (e.g. rotation updates)
+        if hasattr(self, '_token_buffer') and self._token_buffer.strip():
+            leftover = self._token_buffer.strip()
+            if not leftover.startswith("["):
+                self.speaker.say(leftover, priority=PRIORITY_RESPONSE)
+                self._log("ORION", leftover, "#34D399")
+            self._token_buffer = ""
+
+    def _on_ai_response(self, text):
+        """Called when full response or greeting arrives (not streaming tokens)."""
+        self._on_status("IDLE")
+
+        # Flush any leftover token buffer first
+        if hasattr(self, '_token_buffer') and self._token_buffer.strip():
+            leftover = self._token_buffer.strip()
+            if not leftover.startswith("["):
+                self.speaker.say(leftover, priority=PRIORITY_RESPONSE)
+            self._token_buffer = ""
+
         if text.startswith("SYSTEM"):
             msg = text.replace("SYSTEM:", "").replace("SYSTEM CRITICAL:", "").strip()
             self._log("SYS", msg, "#94A3B8")
-            # Also add to alerts box for visibility
             self.alerts_box.append(f"<span style='color:#94A3B8;'>[SEC] {msg}</span>")
             return
 
         self._log("ORION", text, "#34D399")
-        self.speaker.say(text)
-
-    def _on_token_received(self, token):
-        """Handle individual streaming tokens for real-time TTS."""
-        # Accumulate tokens into sentences for TTS
-        if not hasattr(self, '_token_buffer'):
-            self._token_buffer = ""
-        
-        self._token_buffer += token
-        
-        # Check if we have a complete sentence to speak
-        # Split on sentence boundaries
-        parts = re.split(r'(?<=[.!?\n]) ', self._token_buffer)
-        if len(parts) > 1:
-            # Speak all complete sentences immediately
-            for sentence in parts[:-1]:
-                if sentence.strip() and not sentence.strip().startswith("["):
-                    self.speaker.say(sentence.strip(), priority=PRIORITY_RESPONSE)
-            # Keep the incomplete part
-            self._token_buffer = parts[-1]
+        # Only speak if this isn't already covered by token streaming
+        # Greetings arrive here directly (not via tokens) so always speak them
+        if text.strip():
+            self.speaker.say(text, priority=PRIORITY_RESPONSE)
 
     def _log(self, sender, text, color):
         """Append a formatted message to the COMMS LOG panel."""
