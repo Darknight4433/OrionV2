@@ -105,8 +105,9 @@ class AIManager:
         self.ollama_model = getattr(settings, "OLLAMA_MODEL", "gemma3")
         self.is_tinyllama = "tinyllama" in self.ollama_model.lower()
 
-        logger.info(f"AI Manager initialized. Primary: Ollama/{self.ollama_model}, "
-                    f"Fallback: Gemini ({'configured' if self.gemini_keys else 'no keys — Ollama only'})")
+        logger.info(f"AI Manager initialized. Primary: Gemini (fast), "
+                    f"Fallback: Ollama/{self.ollama_model} (offline), "
+                    f"Gemini keys: {len(self.gemini_keys)}")
 
     # ──────────────────────────────────────────
     # PUBLIC API
@@ -183,12 +184,11 @@ class AIManager:
 
     def _get_provider_chain(self, complexity: QueryComplexity) -> list:
         """
-        Provider chain:
-          ALL queries → Ollama (gemma3) first — free, local, always on
-          If Ollama fails → Gemini API fallback
-          OpenRouter is intentionally removed.
+        On CPU-only machines Ollama is too slow (5-7s per response).
+        Gemini Flash responds in ~500ms so use it as primary.
+        Ollama is kept as offline fallback when there's no internet.
         """
-        return [AIProvider.LOCAL, AIProvider.GEMINI]
+        return [AIProvider.GEMINI, AIProvider.LOCAL]
 
     # ──────────────────────────────────────────
     # PROVIDER IMPLEMENTATIONS
