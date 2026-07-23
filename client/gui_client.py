@@ -178,8 +178,9 @@ class SpeakerThread(QThread):
 
     # ── Playback ──
     def _play_audio(self, audio_bytes):
-        """Write audio bytes to a temp .wav file and play through pygame."""
-        suffix = ".wav"
+        """Write audio bytes to temp file and play through pygame."""
+        # eleven_flash_v2_5 returns mp3
+        suffix = ".mp3"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as fp:
             fp.write(audio_bytes)
             temp_path = fp.name
@@ -311,10 +312,10 @@ class SpeakerThread(QThread):
             }
             data = {
                 "text": text,
-                "model_id": "eleven_monolingual_v1",
+                "model_id": "eleven_flash_v2_5",
                 "voice_settings": {
                     "stability": 0.5,
-                    "similarity_boost": 0.5
+                    "similarity_boost": 0.75
                 }
             }
             response = requests.post(url, json=data, headers=headers)
