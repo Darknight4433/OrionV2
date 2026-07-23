@@ -1,21 +1,12 @@
 """
 AI Manager — The Unified AI Gateway for ORION
 ==============================================
-Routes requests to the optimal AI backend based on:
-  • Complexity of the query
-  • Availability of each provider
-  • Cost optimization (local first, cloud only when needed)
+Provider Logic:
+  1. Ollama (gemma3) — PRIMARY. Local, free, always tried first.
+                        Handles 100% of queries when running.
+  2. Gemini API      — FALLBACK only. Used when Ollama is down or unreachable.
 
-Provider Priority:
-  1. Ollama (TinyLlama/llama3) — Free, instant, handles simple queries
-  2. Gemini — Primary cloud AI for complex reasoning
-  3. OpenRouter — Fallback cloud AI when Gemini is exhausted
-
-Design Principles:
-  • Never block. Always stream.
-  • Local AI handles 70% of queries (simple QA, greetings, tasks).
-  • Cloud AI only for: complex reasoning, summarization, large context, internet research.
-  • Every provider implements the same async generator interface.
+OpenRouter has been removed — not needed with this setup.
 """
 
 import asyncio
@@ -34,9 +25,8 @@ logger = get_logger()
 
 
 class AIProvider(str, Enum):
-    LOCAL = "ollama"
-    GEMINI = "gemini"
-    OPENROUTER = "openrouter"
+    LOCAL = "ollama"    # Primary — gemma3 via Ollama, always tried first
+    GEMINI = "gemini"   # Fallback — cloud, only when Ollama is down
 
 
 class QueryComplexity(str, Enum):
@@ -99,35 +89,24 @@ class AIManager:
     """
 
     def __init__(self):
-        # Provider health tracking
+        # Provider health tracking — Ollama primary, Gemini fallback only
         self.health: Dict[AIProvider, ProviderHealth] = {
             AIProvider.LOCAL: ProviderHealth(),
             AIProvider.GEMINI: ProviderHealth(),
-            AIProvider.OPENROUTER: ProviderHealth(),
         }
 
-        # Gemini state
+        # Gemini state (fallback only — used when Ollama is down)
         self.gemini_keys = settings.GEMINI_API_KEYS
         self.gemini_key_index = 0
         self.gemini_model_cache: Optional[str] = None
 
-        # OpenRouter state
-        self.openrouter_key = getattr(settings, "OPENROUTER_API_KEY", "")
-        self.openrouter_model = getattr(settings, "OPENROUTER_MODEL", "meta-llama/llama-3-8b-instruct")
-
-        # Ollama state
-        # On Pi 4 / Windows: OLLAMA_BASE_URL=http://localhost:11434
-        # On Pi 3: Pi 3 never calls Ollama — requests go to Pi 4's FastAPI
+        # Ollama state (primary brain — always tried first)
         self.ollama_url = getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")
         self.ollama_model = getattr(settings, "OLLAMA_MODEL", "gemma3")
-        
-        # TinyLlama needs special chat template handling (split system/user manually).
-        # Gemma3, Llama3, Mistral etc. all handle standard messages format natively.
         self.is_tinyllama = "tinyllama" in self.ollama_model.lower()
 
-        logger.info(f"AI Manager initialized. Gemini keys: {len(self.gemini_keys)}, "
-                    f"OpenRouter: {'configured' if self.openrouter_key else 'not configured'}, "
-                    f"Ollama: {self.ollama_url}/{self.ollama_model}")
+        logger.info(f"AI Manager initialized. Primary: Ollama/{self.ollama_model}, "
+                    f"Fallback: Gemini ({'configured' if self.gemini_keys else 'no keys — Ollama only'})")
 
     # ──────────────────────────────────────────
     # PUBLIC API
@@ -204,15 +183,12 @@ class AIManager:
 
     def _get_provider_chain(self, complexity: QueryComplexity) -> list:
         """
-        Returns ordered list of providers to try based on query complexity.
-        
-        Simple/Moderate → Local first, then cloud
-        Complex/Internet → Cloud first (needs reasoning power), local fallback
+        Provider chain:
+          ALL queries → Ollama (gemma3) first — free, local, always on
+          If Ollama fails → Gemini API fallback
+          OpenRouter is intentionally removed.
         """
-        if complexity in (QueryComplexity.SIMPLE, QueryComplexity.MODERATE):
-            return [AIProvider.LOCAL, AIProvider.GEMINI, AIProvider.OPENROUTER]
-        else:  # COMPLEX or INTERNET
-            return [AIProvider.GEMINI, AIProvider.OPENROUTER, AIProvider.LOCAL]
+        return [AIProvider.LOCAL, AIProvider.GEMINI]
 
     # ──────────────────────────────────────────
     # PROVIDER IMPLEMENTATIONS
@@ -227,9 +203,6 @@ class AIManager:
                 yield chunk
         elif provider == AIProvider.GEMINI:
             async for chunk in self._stream_gemini(prompt):
-                yield chunk
-        elif provider == AIProvider.OPENROUTER:
-            async for chunk in self._stream_openrouter(prompt):
                 yield chunk
 
     # ── Ollama (Local) ──
@@ -378,47 +351,4 @@ class AIManager:
 
         return "gemini-1.5-flash"
 
-    # ── OpenRouter (Cloud Fallback) ──
-
-    async def _stream_openrouter(self, prompt: str) -> AsyncGenerator[str, None]:
-        """Stream from OpenRouter (OpenAI-compatible API)."""
-        if not self.openrouter_key:
-            raise RuntimeError("OpenRouter API key not configured")
-
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.openrouter_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://orion-ai.local",
-            "X-Title": "ORION AI Assistant"
-        }
-        payload = {
-            "model": self.openrouter_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": True
-        }
-
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: requests.post(url, json=payload, headers=headers, stream=True, timeout=30)
-        )
-        response.raise_for_status()
-
-        for line in response.iter_lines():
-            if not line:
-                continue
-            line_str = line.decode("utf-8")
-            if not line_str.startswith("data: "):
-                continue
-            data_str = line_str[6:]  # Strip "data: " prefix
-            if data_str.strip() == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data_str)
-                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                content = delta.get("content", "")
-                if content:
-                    yield content
-            except json.JSONDecodeError:
-                continue
+    # ── OpenRouter removed — Ollama is primary, Gemini is the only fallback ──

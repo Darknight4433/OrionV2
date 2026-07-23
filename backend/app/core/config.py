@@ -8,16 +8,12 @@ class Settings(BaseSettings):
     VERSION: str = "2.0.0"
     API_PREFIX: str = "/api"
     
-    # Gemini Configuration
-    GEMINI_API_KEYS: list[str] = []  # Load from env or file
-    
-    # Ollama Configuration (Local AI — Primary for simple queries)
+    # Ollama Configuration — PRIMARY AI (runs locally)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "gemma3"
-    
-    # OpenRouter Configuration (Cloud Fallback)
-    OPENROUTER_API_KEY: str = ""
-    OPENROUTER_MODEL: str = "meta-llama/llama-3-8b-instruct"
+
+    # Gemini Configuration — FALLBACK only (cloud, when Ollama is down)
+    GEMINI_API_KEYS: list[str] = []
     
     # Voice Configuration
     SARVAM_API_KEYS: list[str] = []

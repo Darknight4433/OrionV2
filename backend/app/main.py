@@ -105,7 +105,7 @@ app.include_router(ws_router)
 async def startup_event():
     logger.info("=" * 55)
     logger.info("  ORION Brain V2 — WebSocket Architecture")
-    logger.info(f"  AI: TinyLlama (Ollama) → Gemini → OpenRouter")
+    logger.info(f"  AI: Ollama/gemma3 (primary) → Gemini (fallback)")
     logger.info("=" * 55)
 
     LifecycleManager()
