@@ -25,8 +25,9 @@ logger = get_logger()
 
 
 class AIProvider(str, Enum):
-    LOCAL = "ollama"    # Primary — gemma3 via Ollama, always tried first
-    GEMINI = "gemini"   # Fallback — cloud, only when Ollama is down
+    LOCAL  = "ollama"   # CPU fallback only
+    GEMINI = "gemini"   # Google — free tier, quota limits
+    GROQ   = "groq"     # Primary — free, ~500ms, runs on Groq LPU chips
 
 
 class QueryComplexity(str, Enum):
@@ -89,25 +90,30 @@ class AIManager:
     """
 
     def __init__(self):
-        # Provider health tracking — Ollama primary, Gemini fallback only
+        # Provider health tracking
         self.health: Dict[AIProvider, ProviderHealth] = {
-            AIProvider.LOCAL: ProviderHealth(),
+            AIProvider.GROQ:   ProviderHealth(),
             AIProvider.GEMINI: ProviderHealth(),
+            AIProvider.LOCAL:  ProviderHealth(),
         }
 
-        # Gemini state (fallback only — used when Ollama is down)
+        # Groq state (primary — free, ~500ms on LPU)
+        self.groq_api_key = getattr(settings, "GROQ_API_KEY", "")
+        self.groq_model   = getattr(settings, "GROQ_MODEL", "llama-3.1-8b-instant")
+
+        # Gemini state (secondary fallback)
         self.gemini_keys = settings.GEMINI_API_KEYS
         self.gemini_key_index = 0
         self.gemini_model_cache: Optional[str] = None
 
-        # Ollama state (primary brain — always tried first)
-        self.ollama_url = getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")
-        self.ollama_model = getattr(settings, "OLLAMA_MODEL", "gemma3")
+        # Ollama state (last resort — CPU only, slow)
+        self.ollama_url   = getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")
+        self.ollama_model = getattr(settings, "OLLAMA_MODEL", "phi3:latest")
         self.is_tinyllama = "tinyllama" in self.ollama_model.lower()
 
-        logger.info(f"AI Manager initialized. Primary: Gemini (fast), "
-                    f"Fallback: Ollama/{self.ollama_model} (offline), "
-                    f"Gemini keys: {len(self.gemini_keys)}")
+        logger.info(f"AI Manager — Groq: {'configured' if self.groq_api_key else 'NO KEY'} | "
+                    f"Gemini: {len(self.gemini_keys)} keys | "
+                    f"Ollama: {self.ollama_model} (CPU fallback)")
 
     # ──────────────────────────────────────────
     # PUBLIC API
@@ -183,14 +189,8 @@ class AIManager:
     # ──────────────────────────────────────────
 
     def _get_provider_chain(self, complexity: QueryComplexity) -> list:
-        """
-        Simple queries → Ollama first (instant, local)
-        Complex queries → Gemini first (better reasoning)
-        Both fall back to the other if unavailable.
-        """
-        if complexity == QueryComplexity.COMPLEX:
-            return [AIProvider.GEMINI, AIProvider.LOCAL]
-        return [AIProvider.LOCAL, AIProvider.GEMINI]
+        """Groq first (free, fast) → Gemini (quota backup) → Ollama (CPU last resort)."""
+        return [AIProvider.GROQ, AIProvider.GEMINI, AIProvider.LOCAL]
 
     # ──────────────────────────────────────────
     # PROVIDER IMPLEMENTATIONS
@@ -199,13 +199,48 @@ class AIManager:
     async def _call_provider(
         self, provider: AIProvider, user_id: str, prompt: str, system_context: str = ""
     ) -> AsyncGenerator[str, None]:
-        """Dispatch to the correct provider's streaming implementation."""
-        if provider == AIProvider.LOCAL:
+        if provider == AIProvider.GROQ:
+            async for chunk in self._stream_groq(prompt, system_context):
+                yield chunk
+        elif provider == AIProvider.LOCAL:
             async for chunk in self._stream_ollama(prompt, system_context):
                 yield chunk
         elif provider == AIProvider.GEMINI:
             async for chunk in self._stream_gemini(prompt, system_context):
                 yield chunk
+
+    # ── Groq (Primary — free, ~500ms) ──
+
+    async def _stream_groq(self, prompt: str, system_context: str = "") -> AsyncGenerator[str, None]:
+        """Stream from Groq — free tier, runs Llama on custom LPU chips, very fast."""
+        if not self.groq_api_key:
+            raise RuntimeError("No Groq API key configured")
+
+        from groq import Groq
+
+        messages = []
+        if system_context:
+            messages.append({"role": "system", "content": system_context})
+        messages.append({"role": "user", "content": prompt})
+
+        loop = asyncio.get_event_loop()
+
+        def _call():
+            client = Groq(api_key=self.groq_api_key)
+            return client.chat.completions.create(
+                model=self.groq_model,
+                messages=messages,
+                stream=True,
+                max_tokens=300,
+                temperature=0.4,
+            )
+
+        stream = await loop.run_in_executor(None, _call)
+
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                yield delta.content
 
     # ── Ollama (Local) ──
 
@@ -324,8 +359,8 @@ class AIManager:
                 m.name for m in genai.list_models()
                 if "generateContent" in m.supported_generation_methods
             ]
-            # Priority order
-            for preferred in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]:
+            # Priority: fastest free models first
+            for preferred in ["gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-2.5-flash", "gemini-flash-lite-latest"]:
                 match = next((m for m in candidates if preferred in m), None)
                 if match:
                     self.gemini_model_cache = match
@@ -336,6 +371,6 @@ class AIManager:
         except Exception:
             pass
 
-        return "gemini-1.5-flash"
+        return "gemini-2.0-flash-lite"
 
     # ── OpenRouter removed — Ollama is primary, Gemini is the only fallback ──

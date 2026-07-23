@@ -9,11 +9,15 @@ class Settings(BaseSettings):
     VERSION: str = "2.0.0"
     API_PREFIX: str = "/api"
     
-    # Ollama Configuration — PRIMARY AI (runs locally)
+    # Groq — PRIMARY (free, ~500ms, get key at https://console.groq.com)
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "llama-3.1-8b-instant"
+
+    # Ollama — CPU last resort fallback
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "phi3:latest"
 
-    # Gemini Configuration — FALLBACK only (cloud, when Ollama is down)
+    # Gemini — secondary fallback
     GEMINI_API_KEYS: list[str] = []
     
     # Voice Configuration
