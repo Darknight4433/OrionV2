@@ -243,17 +243,26 @@ class AIManager:
         """
         url = f"{self.ollama_url}/api/chat"
 
-        # Split prompt into system context + user query.
-        # TinyLlama requires this via manual newline split.
-        # Gemma3 / Llama3 / Mistral all support standard system role natively.
-        parts = prompt.split("\n", 1)
-        if len(parts) == 2 and parts[0].strip():
+        # The generate() method prepends system_context with a "\n" separator:
+        #   full_prompt = f"{system_context}\n{prompt}"
+        # We split on the LAST newline to separate system context from the user query.
+        # This correctly handles multi-line system context (which contains many \n).
+        sep = "\n"
+        split_idx = prompt.rfind(sep)
+        if split_idx != -1:
+            system_part = prompt[:split_idx].strip()
+            user_part = prompt[split_idx + 1:].strip()
+        else:
+            system_part = ""
+            user_part = prompt.strip()
+
+        if system_part:
             messages = [
-                {"role": "system", "content": parts[0].strip()},
-                {"role": "user", "content": parts[1].strip()}
+                {"role": "system", "content": system_part},
+                {"role": "user",   "content": user_part}
             ]
         else:
-            messages = [{"role": "user", "content": prompt}]
+            messages = [{"role": "user", "content": user_part}]
 
         # Context window: Gemma3 supports up to 8192, but cap to 4096 for Windows RAM.
         # On Pi 4 with 4GB RAM keep at 2048 or lower.

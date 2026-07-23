@@ -102,6 +102,8 @@ echo ═════════════════════════
 echo.
 
 REM Start uvicorn — bound to 0.0.0.0 so Pi can connect
-uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+REM Run from backend/ directory so "app.main" resolves correctly
+cd backend
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 pause

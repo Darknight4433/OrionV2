@@ -210,7 +210,7 @@ class SessionHandler:
     async def _stream_response(self, user_id: str, message: str):
         """Stream AI response tokens to the client."""
         full_response = ""
-        first_chunk = True
+        ack_sent = False
 
         try:
             async for chunk in self.intent_router.process_stream(user_id, message):
@@ -222,14 +222,13 @@ class SessionHandler:
                 if not chunk:
                     continue
 
-                if first_chunk:
-                    # First chunk — send as ACK (spoken immediately)
+                # First chunk that is an ACK phrase — send as ack only, don't echo as token
+                if not ack_sent and chunk.strip() in self.intent_router.ack_phrases:
                     await self.send({"type": "ack", "text": chunk})
-                    first_chunk = False
-                    # Don't include filler in full_response
-                    if chunk.strip() in self.intent_router.ack_phrases:
-                        continue
+                    ack_sent = True
+                    continue  # skip adding to full_response and skip token send
 
+                # All other chunks are real response tokens
                 full_response += chunk
                 await self.send({"type": "token", "text": chunk})
 
@@ -306,6 +305,18 @@ def create_ws_endpoint(
     Called from main.py.
     """
 
+    # ── Register GET /ws/status BEFORE /ws/{user_id} ──
+    # FastAPI matches routes in registration order. If /ws/{user_id} is first,
+    # it would match /ws/status as user_id="status". Status must come first.
+    @router.get("/ws/status")
+    async def ws_status():
+        """Shows active WebSocket connections."""
+        return {
+            "protocol": "WebSocket",
+            "active_connections": len(manager.active),
+            "connected_users": list(manager.active.keys()),
+        }
+
     @router.websocket("/ws/{user_id}")
     async def websocket_endpoint(websocket: WebSocket, user_id: str):
         """
@@ -326,14 +337,5 @@ def create_ws_endpoint(
             await handler.handle()
         finally:
             manager.disconnect(user_id)
-
-    @router.get("/ws/status")
-    async def ws_status():
-        """Shows active WebSocket connections."""
-        return {
-            "protocol": "WebSocket",
-            "active_connections": len(manager.active),
-            "connected_users": list(manager.active.keys()),
-        }
 
     return router

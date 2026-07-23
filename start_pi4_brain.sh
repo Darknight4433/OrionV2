@@ -181,7 +181,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Start FastAPI — bound to 0.0.0.0 so Pi 3 can reach it
-uvicorn backend.app.main:app \
+# Run from backend/ so "app.main" package resolves correctly
+cd backend
+uvicorn app.main:app \
     --host 0.0.0.0 \
     --port 8000 \
     --workers 1 \
