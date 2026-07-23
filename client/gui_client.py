@@ -956,9 +956,31 @@ class OrionDashboard(QMainWindow):
     # ── Signals ──
     def _on_status(self, status):
         self.status = status
-        if status != "IDLE":
-            self.pill.setText(f"{status} · {self.current_user}".upper())
-            print(f"[STATUS] {status}")
+        print(f"[STATUS] {status}")
+
+        label = f"{status} · {self.current_user}".upper()
+        self.pill.setText(label)
+
+        if status == "LISTENING":
+            self.pill.setStyleSheet(
+                "background:rgba(6,78,59,180); border:1px solid #34D399; "
+                "color:#34D399; padding:8px 28px; border-radius:20px; "
+                "font-weight:800; font-size:11px;")
+            self.pill.setText(f"🎤 LISTENING · {self.current_user}".upper())
+        elif status == "SPEAKING":
+            self.pill.setStyleSheet(
+                "background:rgba(30,58,138,180); border:1px solid #60A5FA; "
+                "color:#60A5FA; padding:8px 28px; border-radius:20px; "
+                "font-weight:800; font-size:11px;")
+            self.pill.setText(f"🔊 SPEAKING · {self.current_user}".upper())
+        elif status == "THINKING" or status == "PROCESSING":
+            self.pill.setStyleSheet(
+                "background:rgba(92,45,145,180); border:1px solid #A78BFA; "
+                "color:#A78BFA; padding:8px 28px; border-radius:20px; "
+                "font-weight:800; font-size:11px;")
+            self.pill.setText(f"⚡ THINKING · {self.current_user}".upper())
+        elif status == "IDLE":
+            pass
 
     def _on_speaker_status(self, status):
         """Mute mic when ORION is speaking — prevents self-feedback loop."""
