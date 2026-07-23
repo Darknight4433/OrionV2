@@ -96,8 +96,8 @@ class AIManager:
 
         # ── Gemini key pool ──
         self.gemini_keys: List[str] = list(getattr(settings, "GEMINI_API_KEYS", []))
-        self.gemini_key_index = 0
-        self.gemini_model_cache: Optional[str] = None
+        # Pre-cache Gemini model so first request doesn't block
+        self.gemini_model_cache: Optional[str] = "models/gemini-2.0-flash-lite"
 
         # ── Ollama ──
         self.ollama_url   = getattr(settings, "OLLAMA_BASE_URL", "http://localhost:11434")
@@ -202,24 +202,28 @@ class AIManager:
             try:
                 loop = asyncio.get_event_loop()
 
+                chunks_received = []
+
                 def _call():
                     client = Groq(api_key=key)
-                    return client.chat.completions.create(
+                    stream = client.chat.completions.create(
                         model=self.groq_model,
                         messages=messages,
                         stream=True,
                         max_tokens=300,
                         temperature=0.4,
                     )
+                    result = []
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta
+                        if delta and delta.content:
+                            result.append(delta.content)
+                    return result
 
-                stream = await loop.run_in_executor(None, _call)
-                got = False
-                for chunk in stream:
-                    delta = chunk.choices[0].delta
-                    if delta and delta.content:
-                        got = True
-                        yield delta.content
-                if got:
+                chunks = await loop.run_in_executor(None, _call)
+                if chunks:
+                    for c in chunks:
+                        yield c
                     return
 
             except Exception as e:
