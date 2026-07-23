@@ -132,47 +132,30 @@ class VoiceThread(QThread):
 
 
 class SpeakerThread(QThread):
-    """TTS engine — Sarvam AI with key rotation, pyttsx3 fallback."""
+    """TTS engine — pyttsx3 offline only for Windows. Fast, no API calls."""
     status_changed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        # Offline fallback — used directly when no Sarvam/ElevenLabs keys set
         self.offline_engine = pyttsx3.init()
-        self.offline_engine.setProperty('rate', 185)  # 185 = natural pace, 165 is too slow
-        
-        # Try to find a better offline voice (like Zira or Hazel)
-        voices = self.offline_engine.getProperty('voices')
-        if len(voices) > 1:
-            for v in voices:
-                if "Zira" in v.name or "Hazel" in v.name or "Female" in v.name:
-                    self.offline_engine.setProperty('voice', v.id)
-                    break
+        self.offline_engine.setProperty('rate', 175)
 
-        # Sarvam rotation state
-        self.sarvam_keys  = SARVAM_API_KEYS
-        self.sarvam_index = 0
-        self._init_sarvam()
-        
-        # ElevenLabs init
-        self.eleven_api_key = ELEVENLABS_API_KEY
-        self.eleven_voice_id = ELEVENLABS_VOICE_ID
+        # Pick best available Windows voice (Zira is much better than David)
+        voices = self.offline_engine.getProperty('voices')
+        chosen = None
+        for v in voices:
+            if any(name in v.name for name in ["Zira", "Hazel", "Catherine", "Female"]):
+                chosen = v.id
+                break
+        if chosen:
+            self.offline_engine.setProperty('voice', chosen)
+
+        # Disable all cloud TTS — free tier doesn't work
+        self.eleven_api_key = ""
+        self.sarvam_client  = None
 
         self.queue   = queue.PriorityQueue()
         self.running = True
-
-    # ── Sarvam helpers ──
-    def _init_sarvam(self):
-        if self.sarvam_keys:
-            try:
-                from sarvamai import SarvamAI
-                self.sarvam_client = SarvamAI(api_subscription_key=self.sarvam_keys[self.sarvam_index])
-                print(f"[TTS] Sarvam client initialised (Key #{self.sarvam_index})")
-            except Exception as e:
-                print(f"[TTS] Sarvam init error: {e}")
-                self.sarvam_client = None
-        else:
-            self.sarvam_client = None
 
     def _rotate_sarvam(self):
         if not self.sarvam_keys:
@@ -206,54 +189,21 @@ class SpeakerThread(QThread):
 
     # ── Public API ──
     def say(self, text, priority=PRIORITY_RESPONSE):
-        """Queue text for TTS. Filters out SYSTEM updates from being spoken."""
-        if text.startswith("SYSTEM"):
-            # Put system notifications into the alerts box or log, but skip voice
-            print(f"[UI LOG] {text}")
+        if not text or text.startswith("SYSTEM"):
             return
-
         self.queue.put((priority, text))
 
     # ── Main loop ──
     def run(self):
         while self.running:
             try:
-                priority, full_text = self.queue.get(timeout=1)
+                priority, text = self.queue.get(timeout=1)
             except queue.Empty:
                 continue
-
-            if not full_text.strip():
+            if not text.strip():
                 continue
-
             self.status_changed.emit("SPEAKING")
-
-            # Language detection
-            is_hindi = any('\u0900' <= char <= '\u097F' for char in full_text)
-
-            spoken = False
-
-            if not is_hindi and self.eleven_api_key:
-                # ElevenLabs: split into sentences for lower latency
-                sentences = split_sentences(full_text) if len(full_text) > 100 else [full_text]
-                all_spoken = True
-                for sentence in sentences:
-                    if not self._speak_elevenlabs(sentence):
-                        all_spoken = False
-                        break
-                spoken = all_spoken
-
-            if not spoken and self.sarvam_client:
-                sentences = split_sentences(full_text) if len(full_text) > 100 else [full_text]
-                all_spoken = True
-                for sentence in sentences:
-                    if not self._speak_sarvam(sentence):
-                        all_spoken = False
-                        break
-                spoken = all_spoken
-
-            if not spoken:
-                self._speak_offline(full_text)
-
+            self._speak_offline(text)
             self.status_changed.emit("IDLE")
 
             self.status_changed.emit("IDLE")

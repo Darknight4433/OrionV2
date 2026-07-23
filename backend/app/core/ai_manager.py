@@ -184,11 +184,13 @@ class AIManager:
 
     def _get_provider_chain(self, complexity: QueryComplexity) -> list:
         """
-        On CPU-only machines Ollama is too slow (5-7s per response).
-        Gemini Flash responds in ~500ms so use it as primary.
-        Ollama is kept as offline fallback when there's no internet.
+        Simple queries → Ollama first (instant, local)
+        Complex queries → Gemini first (better reasoning)
+        Both fall back to the other if unavailable.
         """
-        return [AIProvider.GEMINI, AIProvider.LOCAL]
+        if complexity == QueryComplexity.COMPLEX:
+            return [AIProvider.GEMINI, AIProvider.LOCAL]
+        return [AIProvider.LOCAL, AIProvider.GEMINI]
 
     # ──────────────────────────────────────────
     # PROVIDER IMPLEMENTATIONS
