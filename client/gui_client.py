@@ -246,12 +246,9 @@ class SpeakerThread(QThread):
                 spoken = all_spoken
 
             if not spoken:
-                # pyttsx3: speak the WHOLE text in ONE runAndWait call
-                # Splitting causes Windows SAPI to cut off after first chunk
                 self._speak_offline(full_text)
 
             self.status_changed.emit("IDLE")
-            self.queue.task_done()
 
             self.status_changed.emit("IDLE")
             self.queue.task_done()
