@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional
 import os
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -22,7 +23,7 @@ class Settings(BaseSettings):
 
     WAKE_WORDS: list[str] = ["orion", "hello orion", "hey orion"]
     SPEAKER_CARD_INDEX: int = 1
-    MIC_INDEX: int | None = None
+    MIC_INDEX: Optional[int] = None
     
     # Vision Configuration
     FACE_MATCH_TOLERANCE: float = 0.50
