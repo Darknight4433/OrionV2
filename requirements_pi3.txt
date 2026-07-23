@@ -1,0 +1,42 @@
+# ═══════════════════════════════════════════════
+#  ORION Pi 3 — BODY Dependencies
+#  Lightweight: ONLY hardware + display + networking
+#  NO AI frameworks, NO Ollama, NO Gemini SDK
+#  Total install ~450MB vs ~1.2GB for full stack
+# ═══════════════════════════════════════════════
+
+# Networking (talk to Pi 4 brain)
+requests==2.31.0
+python-dotenv==1.0.1
+websocket-client==1.8.0
+
+# Camera + Face Recognition
+# NOTE: opencv-python-headless is smaller than opencv-python
+#       (no GUI bindings — PyQt5 handles the display)
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+face-recognition==1.3.0
+dlib==19.24.2
+
+# GUI Dashboard
+PyQt5==5.15.10
+
+# Voice Input
+SpeechRecognition==3.10.4
+pyaudio==0.2.14
+
+# TTS (offline — no API key needed)
+pyttsx3==2.90
+gTTS==2.5.1
+
+# Audio playback
+pygame==2.5.2
+
+# Optional premium TTS (add API keys to .env)
+sarvamai==0.1.0
+
+# System monitoring (CPU/RAM bars in dashboard)
+psutil==5.9.8
+
+# Logging
+loguru==0.7.2

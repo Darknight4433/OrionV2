@@ -2,6 +2,7 @@ fastapi
 uvicorn
 google-generativeai
 pydantic
+pydantic-settings
 sqlalchemy
 requests
 beautifulsoup4
@@ -11,3 +12,4 @@ python-dotenv
 apscheduler
 loguru
 psutil
+httpx

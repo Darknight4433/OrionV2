@@ -330,34 +330,192 @@ class SpeakerThread(QThread):
             print(f"[OFFLINE ERR] {e}")
 
 
-class BackendThread(QThread):
-    """Sends user message to backend /chat and returns response."""
+class OrionWebSocketThread(QThread):
+    """
+    Persistent WebSocket connection to Pi 4 Brain.
+    Replaces BackendThread (SSE) + NotificationThread (polling).
+
+    Single connection handles everything:
+      • Sends chat messages → receives streaming tokens
+      • Sends face detection events → receives greetings
+      • Receives proactive alerts (meetings, battery) pushed by Pi 4
+      • Sends mood updates
+      • Sends interrupt when user speaks mid-response
+
+    Signals:
+      token_received(str)      — individual AI token (for live TTS)
+      response_received(str)   — full response when streaming completes
+      greeting_received(str)   — greeting after face detection
+      alert_received(str)      — proactive alert pushed from Pi 4
+      status_changed(str)      — connection status: CONNECTED / RECONNECTING / OFFLINE
+      error_occurred(str)      — error message
+    """
+    token_received    = pyqtSignal(str)
     response_received = pyqtSignal(str)
+    greeting_received = pyqtSignal(str)
+    alert_received    = pyqtSignal(str)
+    status_changed    = pyqtSignal(str)
     error_occurred    = pyqtSignal(str)
 
-    def __init__(self, message, user_id):
+    def __init__(self, user_id: str):
         super().__init__()
-        self.message = message
+        self.user_id = user_id
+        self.running = True
+        self._ws = None
+        self._send_queue = queue.Queue()
+        # Derive WS URL from API_URL (http→ws, https→wss)
+        self._ws_url = API_URL.replace("http://", "ws://").replace("https://", "wss://")
+
+    # ── Public send API ──
+
+    def send_chat(self, message: str):
+        """Queue a chat message to be sent to Pi 4."""
+        self._send_queue.put({
+            "type": "chat",
+            "user_id": self.user_id,
+            "message": message
+        })
+
+    def send_face(self, detected_user: str):
+        """Notify Pi 4 that a face was detected."""
+        self._send_queue.put({
+            "type": "face",
+            "user_id": detected_user,
+            "action": "detected"
+        })
+
+    def send_mood(self, mood: str):
+        """Send detected mood to Pi 4."""
+        self._send_queue.put({"type": "mood", "mood": mood})
+
+    def send_interrupt(self):
+        """Tell Pi 4 to stop the current AI stream."""
+        self._send_queue.put({"type": "interrupt"})
+
+    def update_user(self, user_id: str):
+        """Update the active user ID (called after face recognition)."""
         self.user_id = user_id
 
+    # ── Thread main loop ──
+
     def run(self):
+        """
+        Maintains a persistent WebSocket connection with automatic reconnect.
+        Uses websocket-client library (sync, runs fine in QThread).
+        """
         try:
-            payload = {"user_id": self.user_id, "message": self.message}
-            # Unified timeout: 5s for connect, 30s for response
-            res = requests.post(f"{API_URL}/chat", json=payload, timeout=(5, 30))
-            if res.status_code == 200:
-                self.response_received.emit(res.json().get("response", ""))
-            else:
-                self.error_occurred.emit(f"Server Error {res.status_code}")
-        except Exception as e:
-            self.error_occurred.emit(f"Offline: {str(e)}")
-        finally:
-            # Ensure the UI thread doesn't stay in 'THINKING' forever
-            self.msleep(100) # Small breathing room
+            import websocket as ws_lib
+        except ImportError:
+            self.error_occurred.emit("websocket-client not installed. Run: pip install websocket-client")
+            return
+
+        RECONNECT_DELAY = 3   # seconds between reconnect attempts
+        MAX_DELAY = 30
+
+        delay = RECONNECT_DELAY
+
+        while self.running:
+            ws_url = f"{self._ws_url}/ws/{self.user_id}"
+            print(f"[WS] Connecting to {ws_url}...")
+            self.status_changed.emit("RECONNECTING")
+
+            try:
+                self._ws = ws_lib.WebSocketApp(
+                    ws_url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                # run_forever blocks until connection drops
+                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+
+            except Exception as e:
+                print(f"[WS] Connection error: {e}")
+
+            if not self.running:
+                break
+
+            # Reconnect with backoff
+            print(f"[WS] Reconnecting in {delay}s...")
+            time.sleep(delay)
+            delay = min(delay * 2, MAX_DELAY)
+
+    def _on_open(self, ws):
+        self.status_changed.emit("CONNECTED")
+        print("[WS] Connected to Pi 4 Brain.")
+        # Start sender loop in a daemon thread
+        threading.Thread(target=self._sender_loop, args=(ws,), daemon=True).start()
+
+    def _on_message(self, ws, raw):
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+
+        msg_type = msg.get("type", "")
+
+        if msg_type == "ack":
+            # Immediate acknowledgment — speak it right away
+            self.token_received.emit(msg.get("text", ""))
+
+        elif msg_type == "token":
+            self.token_received.emit(msg.get("text", ""))
+
+        elif msg_type == "done":
+            full = msg.get("full_response", "")
+            if full:
+                self.response_received.emit(full)
+
+        elif msg_type == "greeting":
+            self.greeting_received.emit(msg.get("text", ""))
+
+        elif msg_type == "alert":
+            self.alert_received.emit(msg.get("text", ""))
+
+        elif msg_type == "error":
+            self.error_occurred.emit(msg.get("message", "Unknown error"))
+
+        elif msg_type == "interrupted":
+            print("[WS] Stream interrupted by server.")
+
+        elif msg_type == "pong":
+            pass  # keepalive reply
+
+    def _on_error(self, ws, error):
+        print(f"[WS] Error: {error}")
+        self.status_changed.emit("OFFLINE")
+
+    def _on_close(self, ws, code, msg):
+        print(f"[WS] Closed (code={code})")
+        self.status_changed.emit("OFFLINE")
+
+    def _sender_loop(self, ws):
+        """Drain the send queue and push messages to the WebSocket."""
+        while self.running:
+            try:
+                msg = self._send_queue.get(timeout=0.5)
+                ws.send(json.dumps(msg))
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[WS] Send error: {e}")
+                break
+
+    def stop(self):
+        self.running = False
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
 
 
 class NotificationThread(QThread):
-    """Polls /notifications every few seconds."""
+    """
+    HTTP fallback for notifications — only used when WebSocket is unavailable.
+    OrionWebSocketThread handles this automatically when WS is connected.
+    """
     new_notification = pyqtSignal(str)
 
     def __init__(self, user_id):
@@ -376,9 +534,9 @@ class NotificationThread(QThread):
                 if res.status_code == 200:
                     for alert in res.json().get("notifications", []):
                         self.new_notification.emit(alert)
-            except:
+            except Exception:
                 pass
-            time.sleep(5)
+            time.sleep(10)  # Less frequent since WS handles real-time alerts
 
 
 class LogTailThread(QThread):
@@ -513,25 +671,33 @@ class OrionDashboard(QMainWindow):
         # UI
         self._build_ui()
         self._start_camera()
-        
-        self.backend_threads = [] # Refs for GC management
 
-        # Health link setup
+        # ── WebSocket Connection to Pi 4 Brain ──
+        self.ws = OrionWebSocketThread(self.current_user)
+        self.ws.token_received.connect(self._on_token_received)
+        self.ws.response_received.connect(self._on_ai_response)
+        self.ws.greeting_received.connect(self._on_ai_response)
+        self.ws.alert_received.connect(self._on_notification)
+        self.ws.status_changed.connect(self._on_ws_status)
+        self.ws.error_occurred.connect(lambda e: self._log("ERR", e, "#F87171"))
+        self.ws.start()
+
+        # ── Health indicator (uses WS status now, fallback HTTP check) ──
         self.server_online = False
         self._health_timer = QTimer()
         self._health_timer.timeout.connect(self._check_server_health)
-        self._health_timer.start(5000)
+        self._health_timer.start(10000)  # Less frequent — WS pushes status
 
-        # Face Recognition Setup (Stabilized)
+        # ── Face Recognition ──
         self.face_locs = []
         self.face_names = []
-        self._name_buffer = [] # For stabilization
-        
+        self._name_buffer = []
+
         self.face_thread = FaceRecognitionThread(self.known_encodings, self.known_names)
         self.face_thread.faces_detected.connect(self._on_faces_found)
         self.face_thread.start()
 
-        # Threads
+        # ── Speaker (TTS) ──
         try:
             self.speaker = SpeakerThread()
             self.speaker.status_changed.connect(self._on_status)
@@ -539,6 +705,7 @@ class OrionDashboard(QMainWindow):
         except Exception as e:
             print(f"[SPEAK ERR] {e}")
 
+        # ── Voice Input (Microphone) ──
         self.voice = None
         try:
             self.voice = VoiceThread()
@@ -549,11 +716,12 @@ class OrionDashboard(QMainWindow):
             print(f"[VOICE INIT ERR] {e}")
             self._on_status("VOICE_UNAVAILABLE")
 
+        # ── HTTP Notification fallback (only fires when WS is offline) ──
         self.notifier = NotificationThread(self.current_user)
         self.notifier.new_notification.connect(self._on_notification)
         self.notifier.start()
 
-        # Real-time Log Tailing
+        # ── Real-time Log Tailing ──
         log_file = os.path.join(PROJECT_ROOT, "logs", "orion.log")
         self.log_tailer = LogTailThread(log_file)
         self.log_tailer.new_log_line.connect(self._on_new_log)
@@ -853,27 +1021,23 @@ class OrionDashboard(QMainWindow):
                 "border-color:#F87171; color:#F87171; background:rgba(69,10,10,120);")
 
     def _request_greeting(self, name):
-        """Fetch a personalized greeting from the backend (port of OMNIS_5 greeting logic)."""
-        def work():
-            try:
-                # Use name.title() for cleaner IDs if needed, but OMNIS uses raw
-                res = requests.get(f"{API_URL}/greet", params={"user_id": name}, timeout=3)
-                if res.status_code == 200:
-                    data = res.json()
-                    if data.get("greeting"):
-                        self._on_ai_response(data["greeting"])
-            except Exception as e:
-                print(f"[GREET ERR] {e}")
-        threading.Thread(target=work, daemon=True).start()
+        """Push face detection to Pi 4 via WebSocket — Pi 4 sends greeting back."""
+        self.ws.update_user(name)
+        self.ws.send_face(name)
+
+    def _on_ws_status(self, status):
+        """Handle WebSocket connection state changes."""
+        self.server_online = (status == "CONNECTED")
+        print(f"[WS STATUS] {status}")
+        if status == "CONNECTED":
+            self._on_status("IDLE")
+        elif status in ("OFFLINE", "RECONNECTING"):
+            self.pill.setStyleSheet(
+                "border-color:#F87171; color:#F87171; background:rgba(69,10,10,120);")
 
     def _sync_mood_background(self, mood):
-        """Send detected mood to backend in a fire-and-forget thread to avoid UI lag."""
-        def work():
-            try:
-                requests.post(f"{API_URL}/mood", params={"mood": mood}, timeout=1)
-            except:
-                pass
-        threading.Thread(target=work, daemon=True).start()
+        """Send detected mood to Pi 4 via WebSocket."""
+        self.ws.send_mood(mood)
 
     # ── Signals ──
     def _on_status(self, status):
@@ -890,20 +1054,16 @@ class OrionDashboard(QMainWindow):
 
     def _on_voice_input(self, text):
         if self.status == "SPEAKING":
-            return
+            # Interrupt current stream — user has something new to say
+            self.ws.send_interrupt()
+            time.sleep(0.1)
+
         self._log("YOU", text, "#38BDF8")
-        
-        # Improved thread management: Avoid overwriting actively running threads
-        bt = BackendThread(text, self.current_user)
-        self.backend_threads.append(bt) 
-        # Clean up finished threads
-        self.backend_threads = [t for t in self.backend_threads if not t.isFinished()]
-        
-        bt.response_received.connect(self._on_ai_response)
-        bt.error_occurred.connect(
-            lambda e: self._log("ERR", e, "#F87171"))
-        bt.start()
         self._on_status("THINKING")
+
+        # Send via persistent WebSocket — no new thread per message
+        self.ws.update_user(self.current_user)
+        self.ws.send_chat(text)
 
     def _on_ai_response(self, text):
         self._on_status("IDLE")
@@ -918,6 +1078,39 @@ class OrionDashboard(QMainWindow):
 
         self._log("ORION", text, "#34D399")
         self.speaker.say(text)
+
+    def _on_token_received(self, token):
+        """Handle individual streaming tokens for real-time TTS."""
+        # Accumulate tokens into sentences for TTS
+        if not hasattr(self, '_token_buffer'):
+            self._token_buffer = ""
+        
+        self._token_buffer += token
+        
+        # Check if we have a complete sentence to speak
+        # Split on sentence boundaries
+        parts = re.split(r'(?<=[.!?\n]) ', self._token_buffer)
+        if len(parts) > 1:
+            # Speak all complete sentences immediately
+            for sentence in parts[:-1]:
+                if sentence.strip() and not sentence.strip().startswith("["):
+                    self.speaker.say(sentence.strip(), priority=PRIORITY_RESPONSE)
+            # Keep the incomplete part
+            self._token_buffer = parts[-1]
+
+    def _log(self, sender, text, color):
+        """Append a formatted message to the COMMS LOG panel."""
+        timestamp = datetime.now().strftime("%H:%M")
+        self.chat.append(
+            f"<div style='margin:4px 0;'>"
+            f"<span style='color:#64748B;font-size:10px;'>{timestamp}</span> "
+            f"<b style='color:{color};'>{sender}:</b> "
+            f"<span style='color:#E2E8F0;'>{text}</span></div>"
+        )
+        # Auto-scroll to bottom
+        self.chat.verticalScrollBar().setValue(
+            self.chat.verticalScrollBar().maximum()
+        )
 
     def _on_notification(self, text):
         self.alerts_box.append(
@@ -949,6 +1142,7 @@ class OrionDashboard(QMainWindow):
         if hasattr(self, 'voice') and self.voice: self.voice.running = False
         if hasattr(self, 'speaker') and self.speaker: self.speaker.running = False
         if hasattr(self, 'notifier') and self.notifier: self.notifier.running = False
+        if hasattr(self, 'ws') and self.ws: self.ws.stop()
         if self.cap: self.cap.release()
         pygame.mixer.quit()
         super().closeEvent(event)

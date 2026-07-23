@@ -5,20 +5,24 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(o
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "ORION"
-    VERSION: str = "1.0.0"
+    VERSION: str = "2.0.0"
     API_PREFIX: str = "/api"
     
     # Gemini Configuration
-    GEMINI_API_KEYS: list[str] = [] # Load from env or file
+    GEMINI_API_KEYS: list[str] = []  # Load from env or file
     
-    # Ollama Configuration (Local Fallback)
+    # Ollama Configuration (Local AI — Primary for simple queries)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "llama3"
+    OLLAMA_MODEL: str = "gemma3"
+    
+    # OpenRouter Configuration (Cloud Fallback)
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_MODEL: str = "meta-llama/llama-3-8b-instruct"
     
     # Voice Configuration
     SARVAM_API_KEYS: list[str] = []
     ELEVENLABS_API_KEY: str = ""
-    ELEVENLABS_VOICE_ID: str = "21m00Tcm4TlvDq8ikWAM" # Default Rachel voice
+    ELEVENLABS_VOICE_ID: str = "21m00Tcm4TlvDq8ikWAM"  # Default Rachel voice
 
     WAKE_WORDS: list[str] = ["orion", "hello orion", "hey orion"]
     SPEAKER_CARD_INDEX: int = 1

@@ -39,6 +39,12 @@ class PermissionMatrix:
             auth_requirement=AuthRequirement.NONE,
             rate_limit_per_min=60
         ),
+        "get_status": ToolSecurityProfile(
+            name="get_status",
+            risk_level=RiskLevel.SAFE,
+            auth_requirement=AuthRequirement.NONE,
+            rate_limit_per_min=30
+        ),
         "add_task": ToolSecurityProfile(
             name="add_task",
             risk_level=RiskLevel.MUNDANE,

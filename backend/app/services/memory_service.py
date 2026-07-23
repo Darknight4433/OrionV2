@@ -1,8 +1,8 @@
 import sqlite3
 import time
 import os
-from .config import settings, PROJECT_ROOT
-from .logging import get_logger
+from ..core.config import settings, PROJECT_ROOT
+from ..core.logging import get_logger
 
 logger = get_logger()
 
