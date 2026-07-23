@@ -282,44 +282,28 @@ class IntentRouter:
     # ──────────────────────────────────────────
 
     def _build_system_context(self, user_id: str, internet_context: str = "") -> str:
-        """Build the system prompt with all available context."""
+        """Build a concise system prompt — shorter = faster first token from Ollama."""
         now = datetime.datetime.now()
-        
-        # Base identity
+
         parts = [
-            "You are ORION, a friendly and intelligent AI assistant system.",
-            f"Current time: {now.strftime('%I:%M %p')}, Date: {now.strftime('%A, %B %d, %Y')}.",
-            f"You are speaking with: {user_id}.",
-            f"User's current mood: {self.current_mood}.",
+            f"You are ORION, a concise AI assistant. Time: {now.strftime('%I:%M %p')}. User: {user_id}.",
+            "Be brief and direct. Max 2 sentences for simple queries.",
         ]
 
-        # Persona
-        if self.current_persona != "default":
-            parts.append(f"Adopt the personality of: {self.current_persona}. Use their tone and vocabulary.")
-
-        # User facts from memory
+        # Only add memory if it exists
         facts = self.memory.get_user_facts(user_id)
         if facts:
-            facts_str = ", ".join(f"{k}: {v}" for k, v in facts.items())
-            parts.append(f"Known facts about this user: {facts_str}")
+            parts.append("User facts: " + ", ".join(f"{k}:{v}" for k, v in list(facts.items())[:3]))
 
-        # Recent conversation context
-        history = self.memory.get_recent_history(user_id, limit=5)
+        history = self.memory.get_recent_history(user_id, limit=3)
         if history:
-            history_str = "\n".join(f"User: {h[0][:80]}\nYou: {h[1][:80]}" for h in history[-3:])
-            parts.append(f"Recent conversation:\n{history_str}")
+            last = history[-1]
+            parts.append(f"Last exchange: User said '{last[0][:60]}', you said '{last[1][:60]}'.")
 
-        # Internet context
         if internet_context:
-            parts.append(f"Search results available:\n{internet_context[:2000]}")
+            parts.append(f"Search results: {internet_context[:500]}")
 
-        # Response guidelines
-        parts.append(
-            "Guidelines: Be concise but warm. Never start with 'AI:' or 'ORION:'. "
-            "Speak naturally as if in conversation. Keep responses under 3 sentences for simple queries."
-        )
-
-        return "\n".join(parts)
+        return " ".join(parts)
 
     def _build_user_prompt(self, user_id: str, text: str) -> str:
         """Construct the final prompt sent to AI."""

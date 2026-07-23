@@ -237,9 +237,9 @@ class AIManager:
         else:
             messages = [{"role": "user", "content": user_part}]
 
-        # Context window: Gemma3 supports up to 8192, but cap to 4096 for Windows RAM.
-        # On Pi 4 with 4GB RAM keep at 2048 or lower.
-        num_ctx = 4096 if not self.is_tinyllama else 1024
+        # Context window: smaller = faster first token
+        # phi3 supports 4096, but 1024 is much faster for responses
+        num_ctx = 1024
 
         payload = {
             "model": self.ollama_model,
@@ -247,7 +247,9 @@ class AIManager:
             "stream": True,
             "options": {
                 "num_ctx": num_ctx,
-                "temperature": 0.7,
+                "temperature": 0.5,  # lower = faster, more focused responses
+                "top_k": 40,
+                "top_p": 0.9,
             }
         }
 
