@@ -49,7 +49,7 @@ def parse_env_list(key):
 SARVAM_API_KEYS = parse_env_list("SARVAM_API_KEYS")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
-print(f"[INIT] Loaded {len(SARVAM_API_KEYS)} Sarvam keys and ElevenLabs support")
+print(f"[INIT] Loaded {len(SARVAM_API_KEYS)} Sarvam keys | ElevenLabs key: {'SET (' + ELEVENLABS_API_KEY[:8] + '...)' if ELEVENLABS_API_KEY else 'NOT SET'} | Voice: {ELEVENLABS_VOICE_ID}")
 
 # Speaker Card selection (Pi-Specific mainly)
 SPEAKER_CARD_INDEX = os.environ.get("SPEAKER_CARD_INDEX", None)
@@ -95,6 +95,7 @@ class VoiceThread(QThread):
         print(f"[ORION] Initialising microphone on index: {mic_idx if mic_idx is not None else 'Default'}")
         self.mic = sr.Microphone(device_index=mic_idx)
         self.running = True
+        self.muted = False  # set True when ORION is speaking to prevent self-feedback
 
     def run(self):
         try:
@@ -104,6 +105,10 @@ class VoiceThread(QThread):
                 print("[ORION] Microphone ready.")
                 while self.running:
                     try:
+                        # Don't listen while ORION is speaking — prevents self-feedback
+                        if self.muted:
+                            time.sleep(0.1)
+                            continue
                         self.status_changed.emit("LISTENING")
                         audio = self.recognizer.listen(source, timeout=2, phrase_time_limit=10)
                         self.status_changed.emit("PROCESSING")
@@ -709,6 +714,7 @@ class OrionDashboard(QMainWindow):
         try:
             self.speaker = SpeakerThread()
             self.speaker.status_changed.connect(self._on_status)
+            self.speaker.status_changed.connect(self._on_speaker_status)
             self.speaker.start()
         except Exception as e:
             print(f"[SPEAK ERR] {e}")
@@ -1079,6 +1085,11 @@ class OrionDashboard(QMainWindow):
         if status != "IDLE":
             self.pill.setText(f"{status} · {self.current_user}".upper())
             print(f"[STATUS] {status}")
+
+    def _on_speaker_status(self, status):
+        """Mute mic when ORION is speaking — prevents self-feedback loop."""
+        if self.voice:
+            self.voice.muted = (status == "SPEAKING")
 
     def _on_manual_input(self):
         text = self.input_field.text().strip()
