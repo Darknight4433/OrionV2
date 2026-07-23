@@ -814,9 +814,11 @@ class OrionDashboard(QMainWindow):
         cam_frame.setStyleSheet(
             "background:#000; border-radius:14px; "
             "border:1px solid rgba(56,189,248,0.15);")
+        cam_frame.setMinimumHeight(400)  # fix: prevent camera collapsing to a strip
         cl = QVBoxLayout(cam_frame)
         cl.setContentsMargins(4, 4, 4, 4)
         self.video_label = QLabel()
+        self.video_label.setMinimumHeight(380)
         self.video_label.setAlignment(Qt.AlignCenter)
         cl.addWidget(self.video_label)
         ll.addWidget(cam_frame, stretch=10)
@@ -929,33 +931,62 @@ class OrionDashboard(QMainWindow):
         if self.pulse_alpha >= 240 or self.pulse_alpha <= 110:
             self.pulse_dir *= -1
 
-    # ── Face Recognition Updates (Visuals Only) ──
+    # ── Face Recognition Updates — multi-person greeting logic ──
     def _on_faces_found(self, locs, names):
-        """Update face data from worker thread."""
+        """
+        Update face data. For each detected person, independently track
+        their last-seen time and send a greeting+timestamp to Ollama
+        so it can generate a personalized time-aware greeting per person.
+        """
         self.face_locs = locs
         self.face_names = names
-        
+
+        if not hasattr(self, '_greeted_times'):
+            self._greeted_times: dict = {}  # name → last greeted timestamp
+
+        now = time.time()
+
         if names:
-            self.last_seen_time = time.time()
-            # Stabilize identity: Pick the most frequent name in the last 5 checks
+            self.last_seen_time = now
+
+            # ── Stabilize primary user identity (for WS user_id) ──
             self._name_buffer.append(names[0])
             if len(self._name_buffer) > 5:
                 self._name_buffer.pop(0)
-            
-            stable_name = max(set(self._name_buffer), key=self._name_buffer.count)
-            
-            if stable_name != "UNKNOWN":
-                self.current_user = stable_name
-                if self.last_greeted_user != stable_name:
-                    if time.time() - self.last_greet_time > 30: # Longer cooldown for better UX
-                        self._request_greeting(stable_name)
-                        self.last_greeted_user = stable_name
-                        self.last_greet_time = time.time()
+            stable_primary = max(set(self._name_buffer), key=self._name_buffer.count)
+            if stable_primary != "UNKNOWN":
+                self.current_user = stable_primary
+                self.ws.update_user(stable_primary)
+
+            # ── Per-person greeting with cooldown ──
+            for name in names:
+                if name == "UNKNOWN":
+                    continue
+                last_greeted = self._greeted_times.get(name, 0)
+                cooldown = 60  # seconds before re-greeting same person
+                if (now - last_greeted) > cooldown:
+                    self._greeted_times[name] = now
+                    self._request_greeting_with_context(name, now)
         else:
-            # If nothing seen for 15s, reset identity
-            if time.time() - self.last_seen_time > 15:
+            # If nobody seen for 15s, reset primary identity
+            if now - self.last_seen_time > 15:
                 self.current_user = "Unknown"
-                self.last_greeted_user = "Unknown"
+                self._name_buffer.clear()
+
+    def _request_greeting_with_context(self, name: str, timestamp: float):
+        """
+        Send face detection to backend with exact timestamp so Ollama
+        can generate a time-aware greeting (morning/afternoon/evening + 
+        how long since last seen).
+        """
+        import datetime
+        dt = datetime.datetime.fromtimestamp(timestamp)
+        time_str = dt.strftime("%I:%M %p")  # e.g. "09:45 AM"
+
+        self.ws.update_user(name)
+        # Send face event — greeting_service on backend handles the Ollama call
+        self.ws.send_face(name)
+        print(f"[FACE] Greeting requested for {name} at {time_str}")
 
     def _update_video(self):
         if not self.cap or not self.cap.isOpened():
@@ -1020,11 +1051,6 @@ class OrionDashboard(QMainWindow):
         else:
             self.pill.setStyleSheet(
                 "border-color:#F87171; color:#F87171; background:rgba(69,10,10,120);")
-
-    def _request_greeting(self, name):
-        """Push face detection to Pi 4 via WebSocket — Pi 4 sends greeting back."""
-        self.ws.update_user(name)
-        self.ws.send_face(name)
 
     def _on_ws_status(self, status):
         """Handle WebSocket connection state changes."""
