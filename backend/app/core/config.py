@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     
     # Groq — PRIMARY (free, ~500ms, get key at https://console.groq.com)
     GROQ_API_KEY: str = ""
+    GROQ_API_KEYS: list[str] = []   # multiple keys for rotation
     GROQ_MODEL: str = "llama-3.1-8b-instant"
 
     # Ollama — CPU last resort fallback
