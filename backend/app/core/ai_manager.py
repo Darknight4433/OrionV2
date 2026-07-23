@@ -226,10 +226,11 @@ class AIManager:
             "messages": messages,
             "stream": True,
             "options": {
-                "num_ctx": num_ctx,
-                "temperature": 0.5,  # lower = faster, more focused responses
+                "num_ctx": 1024,
+                "temperature": 0.3,
                 "top_k": 40,
                 "top_p": 0.9,
+                "stop": ["User:", "Human:", "\nUser", "\nHuman", "Speaker:"]
             }
         }
 

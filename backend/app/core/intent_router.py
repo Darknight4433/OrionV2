@@ -282,27 +282,17 @@ class IntentRouter:
     # ──────────────────────────────────────────
 
     def _build_system_context(self, user_id: str, internet_context: str = "") -> str:
-        """Build a concise system prompt — shorter = faster first token from Ollama."""
+        """Concise system prompt — shorter = faster, no roleplay hallucination."""
         now = datetime.datetime.now()
-
         parts = [
-            f"You are ORION, a concise AI assistant. Time: {now.strftime('%I:%M %p')}. User: {user_id}.",
-            "Be brief and direct. Max 2 sentences for simple queries.",
+            f"You are ORION, a voice assistant. Time: {now.strftime('%I:%M %p, %A %B %d %Y')}. User: {user_id}.",
+            "Rules: Give ONE short direct answer. Never simulate a conversation. Never write 'User:' or 'Vaishnavi:' or 'Speaker:'. Stop after answering.",
         ]
-
-        # Only add memory if it exists
         facts = self.memory.get_user_facts(user_id)
         if facts:
             parts.append("User facts: " + ", ".join(f"{k}:{v}" for k, v in list(facts.items())[:3]))
-
-        history = self.memory.get_recent_history(user_id, limit=3)
-        if history:
-            last = history[-1]
-            parts.append(f"Last exchange: User said '{last[0][:60]}', you said '{last[1][:60]}'.")
-
         if internet_context:
             parts.append(f"Search results: {internet_context[:500]}")
-
         return " ".join(parts)
 
     def _build_user_prompt(self, user_id: str, text: str) -> str:

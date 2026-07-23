@@ -132,68 +132,33 @@ class VoiceThread(QThread):
 
 
 class SpeakerThread(QThread):
-    """TTS engine — pyttsx3 offline only for Windows. Fast, no API calls."""
+    """TTS engine — edge-tts (Microsoft neural voices, free, natural sounding).
+    Falls back to pyttsx3 if no internet."""
     status_changed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
+        self.edge_voice = "en-IN-NeerjaNeural"  # natural Indian English female
+        self.edge_rate  = "+0%"
+
+        # pyttsx3 hard fallback (offline)
         self.offline_engine = pyttsx3.init()
         self.offline_engine.setProperty('rate', 175)
-
-        # Pick best available Windows voice (Zira is much better than David)
         voices = self.offline_engine.getProperty('voices')
-        chosen = None
         for v in voices:
-            if any(name in v.name for name in ["Zira", "Hazel", "Catherine", "Female"]):
-                chosen = v.id
+            if any(n in v.name for n in ["Zira", "Hazel", "Catherine", "Female"]):
+                self.offline_engine.setProperty('voice', v.id)
                 break
-        if chosen:
-            self.offline_engine.setProperty('voice', chosen)
-
-        # Disable all cloud TTS — free tier doesn't work
-        self.eleven_api_key = ""
-        self.sarvam_client  = None
 
         self.queue   = queue.PriorityQueue()
         self.running = True
+        print(f"[TTS] edge-tts ready. Voice: {self.edge_voice}")
 
-    def _rotate_sarvam(self):
-        if not self.sarvam_keys:
-            return
-        self.sarvam_index = (self.sarvam_index + 1) % len(self.sarvam_keys)
-        print(f"[TTS] Rotating → Sarvam Key #{self.sarvam_index}")
-        self._init_sarvam()
-
-    # ── Playback ──
-    def _play_audio(self, audio_bytes):
-        """Write audio bytes to temp file and play through pygame."""
-        # eleven_flash_v2_5 returns mp3
-        suffix = ".mp3"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as fp:
-            fp.write(audio_bytes)
-            temp_path = fp.name
-
-        try:
-            pygame.mixer.music.load(temp_path)
-            pygame.mixer.music.play()
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.05)
-            pygame.mixer.music.unload()
-        except Exception as e:
-            print(f"[PLAY ERR] {e}")
-        finally:
-            try:
-                os.remove(temp_path)
-            except:
-                pass
-
-    # ── Public API ──
     def say(self, text, priority=PRIORITY_RESPONSE):
         if not text or text.startswith("SYSTEM"):
             return
         self.queue.put((priority, text))
 
-    # ── Main loop ──
     def run(self):
         while self.running:
             try:
@@ -203,94 +168,51 @@ class SpeakerThread(QThread):
             if not text.strip():
                 continue
             self.status_changed.emit("SPEAKING")
-            self._speak_offline(text)
+            if not self._speak_edge(text):
+                self._speak_offline(text)
             self.status_changed.emit("IDLE")
 
-            self.status_changed.emit("IDLE")
-            self.queue.task_done()
-
-    def _speak_sarvam(self, text) -> bool:
-        """Attempt Sarvam TTS with key rotation. Returns True on success."""
-        if not self.sarvam_client:
-            return False
-
-        retries = 0
-        max_retries = len(self.sarvam_keys) if self.sarvam_keys else 1
-
-        while retries < max_retries:
-            try:
-                print(f"[TTS] Sarvam Key #{self.sarvam_index} → priya voice")
-                response = self.sarvam_client.text_to_speech.convert(
-                    text=text,
-                    target_language_code="en-IN",
-                    speaker="priya",
-                    model="bulbul:v2" # v2 is much higher quality (human-like)
-                )
-
-                # Handle response — SDK returns object with audios list (base64 wav)
-                audio_bytes = None
-                if hasattr(response, 'audios') and response.audios:
-                    audio_bytes = base64.b64decode(response.audios[0])
-                elif isinstance(response, dict) and 'audios' in response:
-                    audio_bytes = base64.b64decode(response['audios'][0])
-
-                if audio_bytes and len(audio_bytes) > 100:
-                    print(f"[TTS] Got {len(audio_bytes)} bytes. Playing …")
-                    self._play_audio(audio_bytes)
-                    return True
-                else:
-                    print(f"[TTS] Empty audio from Sarvam. Response: {type(response)}")
-                    self._rotate_sarvam()
-                    retries += 1
-
-            except Exception as e:
-                print(f"[TTS ERR] Key #{self.sarvam_index} failed: {e}")
-                
-                # Rotate on ANY error during the retry phase to ensure we find a working key
-                self._rotate_sarvam()
-                retries += 1
-                time.sleep(1) # Brief pause before retry
-        return False
-
-    def _speak_elevenlabs(self, text) -> bool:
-        """Attempt ElevenLabs TTS. Returns True on success."""
-        if not self.eleven_api_key:
-            return False
-        
+    def _speak_edge(self, text) -> bool:
+        """Synthesize with edge-tts and play via pygame."""
         try:
-            print(f"[TTS] ElevenLabs → {self.eleven_voice_id}")
-            url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.eleven_voice_id}"
-            headers = {
-                "Accept": "audio/mpeg",
-                "Content-Type": "application/json",
-                "xi-api-key": self.eleven_api_key
-            }
-            data = {
-                "text": text,
-                "model_id": "eleven_flash_v2_5",
-                "voice_settings": {
-                    "stability": 0.5,
-                    "similarity_boost": 0.75
-                }
-            }
-            response = requests.post(url, json=data, headers=headers)
-            if response.status_code == 200:
-                self._play_audio(response.content)
-                return True
-            else:
-                print(f"[TTS ERR] ElevenLabs status {response.status_code}: {response.text}")
+            import edge_tts, asyncio
+
+            async def _synth():
+                communicate = edge_tts.Communicate(text, self.edge_voice, rate=self.edge_rate)
+                tmp = tempfile.mktemp(suffix=".mp3")
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        with open(tmp, "ab") as f:
+                            f.write(chunk["data"])
+                return tmp
+
+            loop = asyncio.new_event_loop()
+            tmp_path = loop.run_until_complete(_synth())
+            loop.close()
+
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 100:
                 return False
+
+            pygame.mixer.music.load(tmp_path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.05)
+            pygame.mixer.music.unload()
+            try: os.remove(tmp_path)
+            except: pass
+            return True
+
         except Exception as e:
-            print(f"[TTS ERR] ElevenLabs failed: {e}")
+            print(f"[TTS edge ERR] {e}")
             return False
 
     def _speak_offline(self, text):
-        """pyttsx3 fallback — used directly when no API keys configured."""
+        """pyttsx3 fallback when edge-tts fails (no internet)."""
         try:
             self.offline_engine.say(text)
             self.offline_engine.runAndWait()
         except Exception as e:
-            print(f"[OFFLINE ERR] {e}")
+            print(f"[TTS offline ERR] {e}")
 
 
 class OrionWebSocketThread(QThread):
