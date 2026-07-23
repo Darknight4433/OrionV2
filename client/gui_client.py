@@ -820,65 +820,58 @@ class OrionDashboard(QMainWindow):
     # ── Face Recognition Updates — multi-person greeting logic ──
     def _on_faces_found(self, locs, names):
         """
-        Update face data. For each detected person, independently track
-        their last-seen time and send a greeting+timestamp to Ollama
-        so it can generate a personalized time-aware greeting per person.
+        Update face data. Client sends detections to backend every 3s per person.
+        Backend greeting_service handles ALL cooldown + scenario logic (OMNIS-style).
         """
         self.face_locs = locs
         self.face_names = names
 
-        if not hasattr(self, '_greeted_times'):
-            self._greeted_times: dict = {}  # name → last greeted timestamp
+        if not hasattr(self, '_last_sent'):
+            self._last_sent: dict = {}
 
         now = time.time()
 
         if names:
             self.last_seen_time = now
 
-            # ── Stabilize primary user identity (for WS user_id) ──
-            # Buffer last 10 detections — require >60% agreement before confirming
+            # Stabilize primary identity — majority vote over 10 frames
             self._name_buffer.append(names[0])
             if len(self._name_buffer) > 10:
                 self._name_buffer.pop(0)
-
-            # Only confirm identity if one name appears in >60% of recent frames
             name_counts = {}
             for n in self._name_buffer:
                 name_counts[n] = name_counts.get(n, 0) + 1
             top_name = max(name_counts, key=name_counts.get)
             top_count = name_counts[top_name]
             stable_primary = top_name if top_count / len(self._name_buffer) > 0.6 else "UNKNOWN"
+
             if stable_primary != "UNKNOWN":
                 self.current_user = stable_primary
                 self.ws.update_user(stable_primary)
 
-            # ── Per-person greeting with cooldown ──
-            for name in names:
+            # Send each person to backend — rate limited to once per 3s per person
+            # Backend greeting_service decides whether to greet based on its own cooldowns
+            for name in set(names):
                 if name == "UNKNOWN":
                     continue
-                last_greeted = self._greeted_times.get(name, 0)
-                cooldown = 60  # seconds before re-greeting same person
-                if (now - last_greeted) > cooldown:
-                    self._greeted_times[name] = now
+                last_sent = self._last_sent.get(name, 0)
+                if (now - last_sent) > 3:
+                    self._last_sent[name] = now
                     self._request_greeting_with_context(name, now)
         else:
-            # If nobody seen for 15s, reset primary identity
             if now - self.last_seen_time > 15:
                 self.current_user = "Unknown"
                 self._name_buffer.clear()
 
     def _request_greeting_with_context(self, name: str, timestamp: float):
         """
-        Send face detection to backend with exact timestamp so Ollama
-        can generate a time-aware greeting (morning/afternoon/evening + 
-        how long since last seen).
+        Send face detection to backend with timestamp.
+        Backend greeting_service handles all cooldown + scenario logic.
         """
         import datetime
         dt = datetime.datetime.fromtimestamp(timestamp)
-        time_str = dt.strftime("%I:%M %p")  # e.g. "09:45 AM"
-
+        time_str = dt.strftime("%I:%M %p")
         self.ws.update_user(name)
-        # Send face event — greeting_service on backend handles the Ollama call
         self.ws.send_face(name)
         print(f"[FACE] Greeting requested for {name} at {time_str}")
 
