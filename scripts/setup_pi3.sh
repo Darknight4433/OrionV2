@@ -22,9 +22,9 @@ sudo apt install -y --no-install-recommends \
     python3-pip python3-venv python3-dev \
     cmake build-essential libopenblas-dev liblapack-dev \
     libx11-dev libgtk-3-dev libboost-all-dev \
-    portaudio19-dev espeak libatlas-base-dev \
+    portaudio19-dev espeak \
     libavcodec-dev libavformat-dev libswscale-dev \
-    libhdf5-dev libhdf5-serial-dev \
+    libhdf5-dev \
     python3-pyqt5 curl git
 echo -e "${GREEN}[OK] System packages installed${RESET}"
 
