@@ -1,0 +1,17 @@
+[Unit]
+Description=ORION V2 AI Assistant
+After=network.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/OrionV2
+ExecStart=/bin/bash /home/pi/OrionV2/orion_pi3.sh
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+
+[Install]
+WantedBy=graphical-session.target

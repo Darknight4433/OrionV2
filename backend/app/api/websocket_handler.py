@@ -37,6 +37,7 @@ Pi 4 → Pi 3 (server sends):
 
 import asyncio
 import json
+import time
 from typing import Dict, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from ..core.intent_router import IntentRouter
@@ -118,10 +119,13 @@ class SessionHandler:
         self.greeting_service = greeting_service
         self.memory = memory_service
 
-        # Interrupt flag — set to True when Pi 3 sends {"type": "interrupt"}
         self._interrupt = asyncio.Event()
-        # Current streaming task — cancelled on interrupt
         self._stream_task: Optional[asyncio.Task] = None
+
+        # OMNIS-style: track last interaction time for 5s global cooldown
+        self._last_interaction_time: float = 0
+        # OMNIS-style: after greeting, conversation is active (no wake word needed)
+        self.conversation_active: bool = False
 
     async def send(self, message: dict):
         """Send JSON to this client."""
@@ -179,26 +183,28 @@ class SessionHandler:
     # ──────────────────────────────────────────
 
     async def _handle_chat(self, msg: dict):
-        """
-        Process a chat message and stream response tokens back.
-        Runs in a task so it can be cancelled by an interrupt.
-        """
+        """Process a chat message. Respects 5s global interaction cooldown."""
         message = msg.get("message", "").strip()
         user_id = msg.get("user_id", self.user_id)
 
         if not message:
             return
 
+        # OMNIS 5s global interaction cooldown guard
+        now = time.time()
+        if (now - self._last_interaction_time) < 5 and self._last_interaction_time > 0:
+            logger.debug(f"[WS] Interaction cooldown active, ignoring: {message[:30]}")
+            return
+        self._last_interaction_time = now
+
         logger.info(f"[WS] {user_id}: {message}")
 
-        # Cancel any in-progress stream
         if self._stream_task and not self._stream_task.done():
             self._stream_task.cancel()
             await asyncio.sleep(0)
 
         self._interrupt.clear()
 
-        # Create new stream task
         self._stream_task = asyncio.create_task(
             self._stream_response(user_id, message)
         )
@@ -254,10 +260,7 @@ class SessionHandler:
     # ──────────────────────────────────────────
 
     async def _handle_face(self, msg: dict):
-        """
-        Pi 3 detected a face. Pi 4 generates a greeting and pushes it back.
-        This replaces the old polling GET /greet endpoint.
-        """
+        """Pi 3 detected a face. Pi 4 generates greeting and pushes it back."""
         detected_user = msg.get("user_id", "Unknown")
         action = msg.get("action", "detected")
 
@@ -265,19 +268,21 @@ class SessionHandler:
             return
 
         logger.info(f"[WS] Face detected: {detected_user}")
-
-        # Update current user in router
         self.user_id = detected_user
 
-        # Generate greeting
         greeting = self.greeting_service.get_greeting(detected_user)
         if greeting:
+            self._last_interaction_time = time.time()
             await self.send({
                 "type": "greeting",
                 "text": greeting,
                 "user_id": detected_user
             })
-            logger.info(f"[WS] Greeting sent: {greeting[:60]}")
+            # OMNIS conversation handoff — activate conversational mode after greeting
+            # User can now reply without wake word
+            self.conversation_active = True
+            await self.send({"type": "conversation_active", "value": True})
+            logger.info(f"[WS] Greeting + conversation handoff → {detected_user}")
 
     # ──────────────────────────────────────────
     # INTERRUPT
