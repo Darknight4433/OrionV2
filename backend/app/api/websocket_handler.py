@@ -260,9 +260,10 @@ class SessionHandler:
     # ──────────────────────────────────────────
 
     async def _handle_face(self, msg: dict):
-        """Pi 3 detected a face. Pi 4 generates greeting and pushes it back."""
+        """Pi 3 detected a face. Pi 4 generates greeting, triggers movement."""
         detected_user = msg.get("user_id", "Unknown")
         action = msg.get("action", "detected")
+        distance = msg.get("distance", None)  # optional distance in meters
 
         if action != "detected":
             return
@@ -270,6 +271,19 @@ class SessionHandler:
         logger.info(f"[WS] Face detected: {detected_user}")
         self.user_id = detected_user
 
+        # ── Movement decision via TinyLlama ──
+        if hasattr(self, 'movement_service') and self.movement_service:
+            dist_str = f"at {distance}m" if distance else "at unknown distance"
+            situation = f"Person '{detected_user}' detected {dist_str}, greeting mode"
+            import asyncio as _asyncio
+            _asyncio.create_task(
+                _asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.movement_service.decide_and_move(situation)
+                )
+            )
+
+        # ── Greeting ──
         greeting = self.greeting_service.get_greeting(detected_user)
         if greeting:
             self._last_interaction_time = time.time()
@@ -278,8 +292,6 @@ class SessionHandler:
                 "text": greeting,
                 "user_id": detected_user
             })
-            # OMNIS conversation handoff — activate conversational mode after greeting
-            # User can now reply without wake word
             self.conversation_active = True
             await self.send({"type": "conversation_active", "value": True})
             logger.info(f"[WS] Greeting + conversation handoff → {detected_user}")

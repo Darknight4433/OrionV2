@@ -13,3 +13,5 @@ apscheduler
 loguru
 psutil
 httpx
+groq
+pyserial
