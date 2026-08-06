@@ -34,8 +34,18 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip -q
 
-echo -e "${YELLOW}      Installing dlib (20-30 min on Pi 3, normal)...${RESET}"
-pip install dlib
+# Try piwheels pre-built dlib first (no compilation needed)
+echo -e "      Installing dlib (trying pre-built binary)..."
+pip install dlib --extra-index-url https://www.piwheels.org/simple 2>/dev/null || {
+    echo -e "${YELLOW}      Pre-built dlib failed. Trying system package copy...${RESET}"
+    sudo apt install -y python3-dlib python3-face-recognition 2>/dev/null || true
+    # Copy system dlib into venv
+    PYVER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    cp -r /usr/lib/python3/dist-packages/dlib* .venv/lib/python${PYVER}/site-packages/ 2>/dev/null || true
+    cp -r /usr/lib/python3/dist-packages/face_recognition* .venv/lib/python${PYVER}/site-packages/ 2>/dev/null || true
+    echo -e "${YELLOW}      Using system dlib. If face_recognition fails, run:${RESET}"
+    echo -e "      sudo pip3 install --break-system-packages face-recognition"
+}
 pip install -r requirements_pi3.txt
 pip install edge-tts groq
 echo -e "${GREEN}[OK] Python deps installed${RESET}"
