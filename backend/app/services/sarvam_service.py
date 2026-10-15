@@ -2,8 +2,8 @@ import requests
 import os
 import uuid
 from typing import Optional
-from ..core.config import settings
-from ..core.logging import get_logger
+from app.core.config import settings
+from app.core.logging import get_logger
 
 logger = get_logger()
 

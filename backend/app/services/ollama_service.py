@@ -2,9 +2,9 @@ import requests
 import json
 import datetime
 from typing import Generator
-from ..core.config import settings
-from ..core.logging import get_logger
-from ..services.memory_service import MemoryService
+from app.core.config import settings
+from app.core.logging import get_logger
+from app.services.memory_service import MemoryService
 
 logger = get_logger()
 

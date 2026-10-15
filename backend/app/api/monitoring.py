@@ -3,7 +3,7 @@ import psutil
 import shutil
 import sqlite3
 import os
-from ..services.memory_service import MemoryService
+from app.services.memory_service import MemoryService
 
 router = APIRouter()
 memory_service = MemoryService()

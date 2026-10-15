@@ -1,46 +1,44 @@
 """
 Intent Router V2 — ORION Event-Driven Architecture
 ====================================================
-Complete rewrite of the intent engine with:
-  • Clear separation: Rule Engine vs AI vs Internet
-  • Async streaming throughout
-  • Internet detection BEFORE AI processing
-  • Context building with memory, schedule, and user profile
-  • Immediate acknowledgment (never wait before speaking)
-
-Flow:
-  1. User speaks → Text arrives
-  2. Immediate ACK sent to client (filler)
-  3. Intent classification (rule engine check)
-  4. If rule match → execute immediately, stream result
-  5. If no rule match → check internet need
-  6. If internet needed → search → inject context → AI
-  7. If no internet → build context → AI (local or cloud based on complexity)
-  8. Stream response tokens as they arrive
+Unified intent classification, decision routing, and vision execution.
+Complies with Specification Sections 1, 2, 3, 4, 8, 14, 15, 18, 19, 23:
+  • Clear separation: Rule Engine vs Vision VLM vs OCR vs Realtime vs Local Ollama
+  • Complete utterance classification (never triggers camera on fragments or 'what is AI')
+  • Dedicated VISION_QUERY intent -> OpenCV single frame -> HF VLM -> Gemini fallback
+  • Dedicated OCR_QUERY intent -> OpenCV -> OCR extraction -> Ollama summarization -> TTS
+  • Dedicated REALTIME intent -> Gemini internet-capable search & generation
+  • Dedicated LOCAL_AI intent -> Ollama primary local intelligence -> Gemini fallback
+  • User-level isolation with user_id on every interaction
 """
 
 import re
 import random
 import datetime
+import asyncio
 from typing import AsyncGenerator, Optional, Dict, Callable, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
-from .ai_manager import AIManager, QueryComplexity, AIProvider
-from .internet_detector import InternetDetector, InternetDecision
-from ..services.memory_service import MemoryService
-from ..services.browser_service import BrowserService
-from .security_models import PermissionMatrix
-from .logging import get_logger
+from app.core.config import settings
+from app.core.ai_manager import AIManager, QueryComplexity, AIProvider
+from app.core.internet_detector import InternetDetector, InternetDecision
+from app.core.security_models import PermissionMatrix
+from app.core.logging import get_logger
+from app.services.memory_service import MemoryService
+from app.services.browser_service import BrowserService
+from app.services.vision_manager import VisionManager
+from app.services.ocr_service import OCRService
 
 logger = get_logger()
 
 
 class IntentType(str, Enum):
-    RULE_ENGINE = "rule_engine"
-    LOCAL_AI = "local_ai"
-    CLOUD_AI = "cloud_ai"
-    INTERNET_SEARCH = "internet_search"
+    RULE_ENGINE     = "rule_engine"
+    VISION_QUERY    = "vision_query"
+    OCR_QUERY       = "ocr_query"
+    REALTIME        = "realtime"
+    LOCAL_AI        = "local_ai"
 
 
 @dataclass
@@ -58,31 +56,33 @@ class IntentRouter:
     
     Architecture:
       ┌─────────────┐
-      │  User Input  │
+      │  User Input │
       └──────┬──────┘
              │
-      ┌──────▼──────┐
-      │  Rule Engine │──→ Immediate response (meetings, tasks, time, status)
-      └──────┬──────┘
-             │ (no match)
-      ┌──────▼──────────┐
-      │Internet Detector │──→ Search → Context injection → AI
-      └──────┬──────────┘
-             │ (no internet needed)
-      ┌──────▼──────┐
-      │  AI Manager  │──→ Local (simple) or Cloud (complex)
-      └─────────────┘
+      ┌──────▼──────────────┐
+      │ Intent Classifier   │
+      └──────┬──────────────┘
+             │
+             ├── RULE ENGINE  ──→ Time, date, tasks, meetings, system status
+             ├── VISION QUERY ──→ Single-frame OpenCV → HF VLM (Qwen) → Gemini fallback
+             ├── OCR QUERY    ──→ Single-frame OpenCV → OCR extraction → Ollama
+             ├── REALTIME     ──→ Internet-capable provider (Gemini)
+             └── LOCAL AI     ──→ Primary Ollama → Gemini fallback
     """
 
     def __init__(
         self,
         ai_manager: AIManager,
         memory_service: MemoryService,
-        browser_service: BrowserService
+        browser_service: BrowserService,
+        vision_manager: Optional[VisionManager] = None,
+        ocr_service: Optional[OCRService] = None
     ):
         self.ai = ai_manager
         self.memory = memory_service
         self.browser = browser_service
+        self.vision_manager = vision_manager or VisionManager()
+        self.ocr_service = ocr_service or OCRService()
         self.internet_detector = InternetDetector()
 
         # Personality state
@@ -102,11 +102,10 @@ class IntentRouter:
         ]
 
         # Rule Engine: Regex → Handler mapping
-        # Each entry: (pattern, handler_func, command_name, complexity)
         self.rules = [
-            # Time & Date
-            (r"\b(what time|time check|current time)\b", self._rule_time, "get_time", QueryComplexity.SIMPLE),
-            (r"\b(what day|what date|today'?s? date)\b", self._rule_date, "get_time", QueryComplexity.SIMPLE),
+            # Time & Date (expanded for natural phrasing)
+            (r"\b(what time|tell me the time|time check|current time|the time)\b", self._rule_time, "get_time", QueryComplexity.SIMPLE),
+            (r"\b(what day|what date|today'?s? date|what is today)\b", self._rule_date, "get_time", QueryComplexity.SIMPLE),
             
             # Task Management
             (r"(?:add|create|schedule)\s+(?:a\s+)?meeting\s+(.+)", self._rule_add_meeting, "add_task", QueryComplexity.SIMPLE),
@@ -122,86 +121,205 @@ class IntentRouter:
         ]
 
     # ──────────────────────────────────────────
-    # PUBLIC API — Main Entry Point
+    # INTENT CLASSIFICATION (Specification Sections 3, 4, 14)
+    # ──────────────────────────────────────────
+
+    def classify_intent(self, text_stripped: str) -> IntentType:
+        """
+        Classifies the COMPLETE utterance into an authoritative intent.
+        Strictly prevents camera activation on queries like 'what is AI?'.
+        """
+        text_lower = text_stripped.lower().strip()
+
+        # 1. Deterministic Rule Engine match
+        if self._match_rule(text_lower, text_stripped) is not None:
+            return IntentType.RULE_ENGINE
+
+        # 2. OCR Query (Section 14: separate subsystem)
+        ocr_patterns = [
+            r"\bread this\b",
+            r"\bwhat does this say\b",
+            r"\bread what is written\b",
+            r"\bread the text\b",
+            r"\bread this document\b",
+            r"\bread this page\b"
+        ]
+        if any(re.search(p, text_lower) for p in ocr_patterns):
+            return IntentType.OCR_QUERY
+
+        # 3. Vision Query (Section 4: Dedicated intent, strict complete-utterance matching)
+        # MUST NOT match "what is AI?" or general questions containing "this"
+        vision_explicit_patterns = [
+            r"\bwhat (?:is|are) (?:this|that|these|those)(?:\s+(?:object|item|thing))?\b",
+            r"\bwhat am i holding\b",
+            r"\bidentify (?:this|that|the object|the item)\b",
+            r"\bwhat (?:object|item) is this\b",
+            r"\bwhat is in my hand\b",
+            r"\bhow many objects (?:are there|do you see)\b",
+            r"\bwhat do you see\b",
+            r"\blook at (?:this|that)\b",
+            r"\btell me what (?:this|that) is\b",
+            r"\bdescribe what you see\b",
+        ]
+        if any(re.search(p, text_lower) for p in vision_explicit_patterns):
+            return IntentType.VISION_QUERY
+
+        # 4. Realtime / Dynamic Query (Section 3: Internet-capable service / Gemini)
+        realtime_patterns = [
+            r"\b(who is the current|latest news|what happened today|today's news|breaking news)\b",
+            r"\b(current weather|weather today|weather tomorrow|current temperature)\b",
+            r"\b(stock price|market today|election results|who won|who is winning)\b",
+            r"\b(search for|google for|look up on the internet)\b"
+        ]
+        if any(re.search(p, text_lower) for p in realtime_patterns):
+            return IntentType.REALTIME
+
+        # General definitions, concepts, and reasoning are explicitly local (Section 2)
+        if re.search(r"\b(what is (?:ai|a |an |the |quantum|python|machine learning|gravity|dna|photosynthesis))\b", text_lower) or text_lower.startswith("explain "):
+            return IntentType.LOCAL_AI
+
+        dec = self.internet_detector.analyze(text_stripped)
+        if dec.needs_internet and dec.confidence >= 0.85:
+            return IntentType.REALTIME
+
+        # 5. Default General Knowledge / Reasoning -> Local Ollama (Section 2)
+        return IntentType.LOCAL_AI
+
+    # ──────────────────────────────────────────
+    # MAIN PROCESSING PIPELINE
     # ──────────────────────────────────────────
 
     async def process_stream(
-        self, user_id: str, text: str
+        self,
+        user_id: str,
+        text: str,
+        direct_frame = None,
+        image_bytes: Optional[bytes] = None
     ) -> AsyncGenerator[str, None]:
         """
-        Process user input and stream response tokens.
-        
-        This is the main entry point. It:
-          1. Classifies intent
-          2. Sends immediate ACK for AI queries
-          3. Streams the response
-          
-        Yields:
-          Individual text chunks suitable for SSE delivery.
+        Process user input and stream response chunks.
         """
         text_stripped = text.strip()
         text_lower = text_stripped.lower()
 
-        # ── Step 1: Rule Engine Check ──
-        rule_result = self._match_rule(text_lower, text_stripped)
-        if rule_result:
-            pattern, handler, cmd_name, complexity = rule_result
-            
-            # Security check
-            auth = PermissionMatrix.check_permissions(cmd_name, {"query": text})
-            if not auth["allowed"]:
-                yield f"Security blocked: {auth['reason']}"
-                return
-            if auth["needs_approval"]:
-                yield f"This requires your approval. Should I proceed with: {cmd_name}?"
+        intent = self.classify_intent(text_stripped)
+        logger.info(f"[ROUTER] User '{user_id}' query: '{text_stripped}' -> Intent: {intent.value}")
+
+        # ── 1. RULE ENGINE ──
+        if intent == IntentType.RULE_ENGINE:
+            rule_result = self._match_rule(text_lower, text_stripped)
+            if rule_result:
+                pattern, handler, cmd_name, complexity = rule_result
+                auth = PermissionMatrix.check_permissions(cmd_name, {"query": text})
+                if not auth["allowed"]:
+                    yield f"Security blocked: {auth['reason']}"
+                    return
+                if auth["needs_approval"]:
+                    yield f"This requires your approval. Should I proceed with: {cmd_name}?"
+                    return
+
+                match = re.search(pattern, text_lower) or re.search(pattern, text_stripped, re.IGNORECASE)
+                result = await handler(user_id, match, text_stripped)
+                yield result
                 return
 
-            # Execute rule handler
-            match = re.search(pattern, text_lower) or re.search(pattern, text_stripped, re.IGNORECASE)
-            result = await handler(user_id, match, text_stripped)
-            yield result
+        # ── 2. VISION QUERY (Specification Section 8) ──
+        if intent == IntentType.VISION_QUERY:
+            # Immediate voice prompt instructing user
+            yield "Sir, please hold the object clearly in front of the camera and keep it steady."
+            yield "\n"
+            await asyncio.sleep(getattr(settings, "VISION_CAPTURE_DELAY", 1.5))
+
+            # Run visual reasoning
+            result = await self.vision_manager.process_visual_query(
+                user_id=user_id,
+                question=text_stripped,
+                image_bytes=image_bytes,
+                direct_frame=direct_frame
+            )
+
+            yield result.text_response
+
+            # Save interaction text to memory (no raw image stored)
+            self.memory.add_conversation(
+                user_id,
+                text_stripped,
+                result.text_response,
+                permanent=False
+            )
             return
 
-        # ── Step 2: Internet Detection ──
-        internet_decision = self.internet_detector.analyze(text_stripped)
-        
-        if internet_decision.needs_internet and internet_decision.confidence >= 0.70:
-            # Acknowledge immediately
+        # ── 3. OCR QUERY (Specification Section 14) ──
+        if intent == IntentType.OCR_QUERY:
+            yield "Sir, please hold the text steady in front of the camera."
+            yield "\n"
+            await asyncio.sleep(1.0)
+
+            # Capture frame if not provided
+            frame = direct_frame
+            if frame is None and image_bytes is None:
+                loop = asyncio.get_event_loop()
+                frame, val = await loop.run_in_executor(None, self.vision_manager.camera.capture_frame)
+
+            if frame is not None:
+                success, extracted_text = await self.ocr_service.extract_text(frame)
+                if success and extracted_text:
+                    # Summarize/interpret via Ollama if long
+                    if len(extracted_text) > 120:
+                        prompt = f"The following text was read from an image. Summarize it concisely in 1-2 spoken sentences: '{extracted_text}'"
+                        system_context = self._build_system_context(user_id)
+                        async for chunk in self.ai.generate(user_id, prompt, complexity=QueryComplexity.SIMPLE, system_context=system_context):
+                            yield chunk
+                    else:
+                        yield f"Sir, it reads: '{extracted_text}'"
+                else:
+                    yield "Sir, I couldn't detect legible text from the camera. Please ensure good lighting and hold it steady."
+            else:
+                yield "Sir, camera capture was unavailable for reading."
+            return
+
+        # ── 4. REALTIME / DYNAMIC QUERY (Specification Section 3) ──
+        if intent == IntentType.REALTIME:
             yield self._get_ack("searching")
             yield "\n"
 
-            # Perform search
-            search_context = await self._perform_search(internet_decision.search_query or text_stripped)
-            
-            # Build enhanced prompt with search results
-            system_context = self._build_system_context(user_id, internet_context=search_context)
-            prompt = f"Based on the following search results, answer the user's question.\n\nSearch Results:\n{search_context}\n\nUser Question: {text_stripped}"
+            internet_decision = self.internet_detector.analyze(text_stripped)
+            search_query = internet_decision.search_query or text_stripped
+            search_context = await self._perform_search(search_query)
 
+            system_context = self._build_system_context(user_id, internet_context=search_context)
+            prompt = (
+                f"Based on current real-time data, answer concisely in 1-2 sentences.\n"
+                f"Search Context: {search_context}\n"
+                f"User Question: {text_stripped}"
+            )
+
+            # Uses internet-capable provider (Gemini primary)
+            full_response = ""
             async for chunk in self.ai.generate(
                 user_id, prompt,
-                complexity=QueryComplexity.COMPLEX,
+                complexity=QueryComplexity.INTERNET,
                 system_context=system_context
             ):
-                yield chunk
+                clean = self._clean_response(chunk)
+                if clean:
+                    full_response += clean
+                    yield clean
 
-            # Save to memory
-            self.memory.add_conversation(user_id, text_stripped, "[Internet-assisted response]", permanent=False)
+            if full_response:
+                self.memory.add_conversation(user_id, text_stripped, full_response[:500], permanent=False)
             return
 
-        # ── Step 3: AI Processing (No Internet Needed) ──
-        # Determine complexity
+        # ── 5. LOCAL AI / GENERAL TEXT QUERY (Specification Section 2) ──
         complexity = self._assess_complexity(text_stripped)
-
-        # Acknowledge for complex queries (gives user instant feedback)
         if complexity in (QueryComplexity.COMPLEX, QueryComplexity.MODERATE):
             yield self._get_ack("thinking")
             yield "\n"
 
-        # Build context
         system_context = self._build_system_context(user_id)
         prompt = self._build_user_prompt(user_id, text_stripped)
 
-        # Stream AI response
+        # Uses Ollama primary local intelligence, with Gemini fallback
         full_response = ""
         async for chunk in self.ai.generate(
             user_id, prompt,
@@ -213,7 +331,6 @@ class IntentRouter:
                 full_response += clean
                 yield clean
 
-        # Save to memory (summarized)
         if full_response:
             self.memory.add_conversation(user_id, text_stripped, full_response[:500], permanent=False)
 
@@ -223,103 +340,92 @@ class IntentRouter:
 
     async def _rule_time(self, user_id: str, match, original: str) -> str:
         now = datetime.datetime.now()
-        return f"It is currently {now.strftime('%I:%M %p')} on {now.strftime('%A, %B %d')}."
+        return f"Sir, it is currently {now.strftime('%I:%M %p')} on {now.strftime('%A, %B %d')}."
 
     async def _rule_date(self, user_id: str, match, original: str) -> str:
         now = datetime.datetime.now()
-        return f"Today is {now.strftime('%A, %B %d, %Y')}."
+        return f"Sir, today is {now.strftime('%A, %B %d, %Y')}."
 
     async def _rule_add_meeting(self, user_id: str, match, original: str) -> str:
         details = match.group(1) if match else original
         self.memory.add_task(f"Meeting: {details}", user_id=user_id)
-        return f"Done. Meeting scheduled: {details}"
+        return f"Sir, your meeting is scheduled: {details}"
 
     async def _rule_add_task(self, user_id: str, match, original: str) -> str:
         details = match.group(1) if match else original
         self.memory.add_task(details, user_id=user_id)
-        return f"Task added: {details}"
+        return f"Sir, task added: {details}"
 
     async def _rule_add_reminder(self, user_id: str, match, original: str) -> str:
         details = match.group(1) if match else original
         self.memory.add_task(f"Reminder: {details}", user_id=user_id)
-        return f"I'll remind you: {details}"
+        return f"Sir, I will remind you: {details}"
 
     async def _rule_battery(self, user_id: str, match, original: str) -> str:
-        # Placeholder — will integrate with actual robot hardware
         try:
             import psutil
             battery = psutil.sensors_battery()
             if battery:
                 pct = battery.percent
                 plugged = "charging" if battery.power_plugged else "on battery"
-                return f"Battery is at {pct}%, {plugged}."
+                return f"Sir, battery is at {pct}%, {plugged}."
         except Exception:
             pass
-        return "Battery status unavailable on this system."
+        return "Sir, battery status is unavailable on this hardware."
 
     async def _rule_system_status(self, user_id: str, match, original: str) -> str:
         import psutil
         cpu = psutil.cpu_percent()
         ram = psutil.virtual_memory().percent
-        return f"System status: CPU at {cpu}%, RAM at {ram}%. All systems operational."
+        return f"Sir, system status is operational. CPU usage is {cpu}%, and memory usage is {ram}%."
 
     async def _rule_search(self, user_id: str, match, original: str) -> str:
         query = match.group(1) if match else original
-        
-        # Security check
         auth = PermissionMatrix.check_permissions("google_search", {"query": query})
         if not auth["allowed"]:
             return f"Search blocked: {auth['reason']}"
 
         results = await self.browser.perform_google_search(query)
         if not results:
-            return f"I searched for '{query}' but couldn't find relevant results."
-        
-        return "Here's what I found:\n" + "\n".join(f"• {r}" for r in results[:5])
+            return f"Sir, I searched for '{query}' but couldn't find relevant results."
+        return "Sir, here is what I found:\n" + "\n".join(f"• {r}" for r in results[:4])
 
     # ──────────────────────────────────────────
     # CONTEXT BUILDING
     # ──────────────────────────────────────────
 
     def _build_system_context(self, user_id: str, internet_context: str = "") -> str:
-        """Concise system prompt — shorter = faster, no roleplay hallucination."""
         now = datetime.datetime.now()
         parts = [
-            f"You are ORION, a voice assistant. Time: {now.strftime('%I:%M %p, %A %B %d %Y')}. User: {user_id}.",
-            "Rules: Give ONE short direct answer. Never simulate a conversation. Never write 'User:' or 'Vaishnavi:' or 'Speaker:'. Stop after answering.",
+            f"You are ORION, a professional voice executive assistant. Time: {now.strftime('%I:%M %p, %A %B %d %Y')}. User: {user_id}.",
+            "Rules: Answer in 1-2 concise sentences. Be calm, polite, and address the user as Sir when appropriate. Never simulate back-and-forth dialogue or write roleplay markers.",
         ]
         facts = self.memory.get_user_facts(user_id)
         if facts:
             parts.append("User facts: " + ", ".join(f"{k}:{v}" for k, v in list(facts.items())[:3]))
         if internet_context:
-            parts.append(f"Search results: {internet_context[:500]}")
+            parts.append(f"Context: {internet_context[:400]}")
         return " ".join(parts)
 
     def _build_user_prompt(self, user_id: str, text: str) -> str:
-        """Construct the final prompt sent to AI."""
-        return text  # Context is in system_context; keep user prompt clean
+        return text
 
     # ──────────────────────────────────────────
     # HELPERS
     # ──────────────────────────────────────────
 
     def _match_rule(self, text_lower: str, text_original: str) -> Optional[Tuple]:
-        """Check if input matches any rule engine pattern."""
         for pattern, handler, cmd_name, complexity in self.rules:
             if re.search(pattern, text_lower):
                 return (pattern, handler, cmd_name, complexity)
         return None
 
     def _assess_complexity(self, text: str) -> QueryComplexity:
-        """Heuristic complexity assessment for AI routing."""
         text_lower = text.lower()
         word_count = len(text.split())
-
-        # Simple: short greetings, yes/no, single-word
         if word_count <= 4:
             return QueryComplexity.SIMPLE
 
-        # Complex indicators
         complex_patterns = [
             r"\b(explain|analyze|compare|summarize|write|compose|create a|design)\b",
             r"\b(why|how does|what if|pros and cons|difference between)\b",
@@ -329,28 +435,24 @@ class IntentRouter:
             if re.search(pattern, text_lower):
                 return QueryComplexity.COMPLEX
 
-        # Default: moderate
         return QueryComplexity.MODERATE
 
     async def _perform_search(self, query: str) -> str:
-        """Execute internet search and return formatted results."""
         try:
             results = await self.browser.perform_google_search(query)
             if results:
-                return "\n".join(results[:5])
+                return "\n".join(results[:4])
             return "No search results found."
         except Exception as e:
-            logger.error(f"Search failed: {e}")
+            logger.error(f"[SEARCH ERR] {e}")
             return "Search unavailable."
 
     def _get_ack(self, context: str = "general") -> str:
-        """Get an immediate acknowledgment phrase."""
         if context == "searching":
             options = [
-                "Let me search for that.",
-                "Searching the internet...",
-                "Looking that up for you.",
-                "One moment, searching...",
+                "Let me look into that.",
+                "Checking current records...",
+                "One moment please.",
             ]
         elif context == "thinking":
             options = self.ack_phrases
@@ -359,7 +461,6 @@ class IntentRouter:
         return random.choice(options)
 
     def _clean_response(self, text: str) -> str:
-        """Remove AI prefixes and artifacts."""
         if not text:
             return ""
         cleaned = re.sub(r'(?i)^(AI|ORION|OMNIS|SYSTEM|Assistant):\s*', '', text)

@@ -2,11 +2,11 @@ import re
 import random
 import datetime
 from typing import Dict, Any, List, Optional
-from ..services.gemini_service import GeminiService
-from ..services.ollama_service import OllamaService
-from ..services.memory_service import MemoryService
-from ..services.browser_service import BrowserService
-from ..core.security_models import PermissionMatrix
+from app.services.gemini_service import GeminiService
+from app.services.ollama_service import OllamaService
+from app.services.memory_service import MemoryService
+from app.services.browser_service import BrowserService
+from app.core.security_models import PermissionMatrix
 
 class IntentEngine:
     def __init__(self, 

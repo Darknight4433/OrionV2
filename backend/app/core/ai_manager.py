@@ -31,8 +31,9 @@ import google.generativeai as genai
 from enum import Enum
 from typing import AsyncGenerator, Optional, Dict, Any, List
 from dataclasses import dataclass, field
-from .config import settings
-from .logging import get_logger
+from app.core.config import settings
+from app.core.logging import get_logger
+from app.core.credential_manager import CredentialManager, TokenState
 
 logger = get_logger()
 
@@ -94,8 +95,20 @@ class AIManager:
         self.groq_key_index = 0
         self.groq_model = getattr(settings, "GROQ_MODEL", "llama-3.1-8b-instant")
 
-        # ── Gemini key pool ──
-        self.gemini_keys: List[str] = list(getattr(settings, "GEMINI_API_KEYS", []))
+        # ── Gemini key pool with CredentialManager ──
+        gemini_pool: List[str] = list(getattr(settings, "GEMINI_API_KEYS", []))
+        for key in [
+            "GEMINI_API_KEY", "GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3",
+            "GEMINI_API_KEY_4", "GEMINI_API_KEY_5", "GEMINI_API_KEYS_1", "GEMINI_API_KEYS_2",
+            "GEMINI_API_KEYS_3", "GEMINI_API_KEYS_4"
+        ]:
+            val = getattr(settings, key, "")
+            if val and val not in gemini_pool:
+                gemini_pool.append(val)
+
+        self.gemini_credentials = CredentialManager("Gemini", gemini_pool)
+        self.gemini_keys = [s.token for s in self.gemini_credentials.token_states]
+        self.gemini_key_index = 0
         # Pre-cache Gemini model so first request doesn't block
         self.gemini_model_cache: Optional[str] = "models/gemini-2.0-flash-lite"
 
@@ -106,7 +119,7 @@ class AIManager:
         logger.info(
             f"AI Manager ready — "
             f"Groq: {len(self.groq_keys)} key(s) | "
-            f"Gemini: {len(self.gemini_keys)} key(s) | "
+            f"Gemini: {self.gemini_credentials.total_keys} key(s) | "
             f"Ollama: {self.ollama_model} (CPU fallback)"
         )
 
@@ -123,7 +136,7 @@ class AIManager:
         force_provider: Optional[AIProvider] = None
     ) -> AsyncGenerator[str, None]:
 
-        chain = [force_provider] if force_provider else self._get_provider_chain()
+        chain = [force_provider] if force_provider else self._get_provider_chain(complexity)
 
         for provider in chain:
             if not self.health[provider].is_ready():
@@ -145,7 +158,7 @@ class AIManager:
         yield "I'm having trouble connecting right now. Please try again."
 
     def get_health_status(self) -> Dict[str, Any]:
-        return {
+        status = {
             p.value: {
                 "available": h.is_ready(),
                 "failures": h.consecutive_failures,
@@ -153,14 +166,25 @@ class AIManager:
             }
             for p, h in self.health.items()
         }
+        status["gemini_credentials"] = self.gemini_credentials.get_status()
+        return status
 
     # ──────────────────────────────────────────
     # ROUTING
     # ──────────────────────────────────────────
 
-    def _get_provider_chain(self) -> list:
-        """Groq → Gemini → Ollama. Always this order."""
-        return [AIProvider.GROQ, AIProvider.GEMINI, AIProvider.LOCAL]
+    def _get_provider_chain(self, complexity: QueryComplexity = QueryComplexity.MODERATE) -> list:
+        """
+        Complies with Specification Sections 1, 2, 17, 18:
+          • GENERAL/TEXT QUERY: Ollama (primary local intelligence) → Gemini (fallback) → Groq
+          • REALTIME/DYNAMIC QUERY: Gemini (internet-capable) → Groq
+        """
+        if complexity == QueryComplexity.INTERNET:
+            # Dynamic / Realtime info requires internet-capable providers
+            return [AIProvider.GEMINI, AIProvider.GROQ]
+        
+        # Local general queries: Ollama primary, Gemini fallback
+        return [AIProvider.LOCAL, AIProvider.GEMINI, AIProvider.GROQ]
 
     # ──────────────────────────────────────────
     # DISPATCH
@@ -246,15 +270,18 @@ class AIManager:
     # ──────────────────────────────────────────
 
     async def _stream_gemini(self, prompt: str, system_context: str = "") -> AsyncGenerator[str, None]:
-        if not self.gemini_keys:
+        if not self.gemini_credentials.total_keys:
             raise RuntimeError("No Gemini API keys configured")
 
-        max_retries = len(self.gemini_keys)
+        max_retries = max(1, self.gemini_credentials.total_keys)
         retries = 0
 
         while retries < max_retries:
-            key = self.gemini_keys[self.gemini_key_index]
-            genai.configure(api_key=key)
+            tok_state = self.gemini_credentials.get_token()
+            if not tok_state:
+                break
+
+            genai.configure(api_key=tok_state.token)
             model_name = self._discover_gemini_model()
 
             try:
@@ -268,9 +295,11 @@ class AIManager:
                     lambda: model.generate_content(prompt, stream=True)
                 )
                 buf = ""
+                has_content = False
                 for chunk in response:
                     try:
                         if chunk.text:
+                            has_content = True
                             buf += chunk.text
                             parts = re.split(r'(?<=[.!?\n]) ', buf)
                             if len(parts) > 1:
@@ -282,23 +311,25 @@ class AIManager:
                         continue
                 if buf.strip():
                     yield buf.strip()
-                return
+                if has_content:
+                    tok_state.mark_success()
+                    return
 
             except Exception as e:
                 err = str(e).lower()
-                if any(x in err for x in ["quota", "429", "exhausted", "resource", "limit"]):
-                    logger.warning(f"Gemini key #{self.gemini_key_index} quota hit. Rotating...")
-                    self._rotate_gemini()
+                tok_state.mark_failure(str(e))
+                if any(x in err for x in ["quota", "429", "exhausted", "resource", "limit", "invalid", "unauthenticated", "permission"]):
+                    logger.warning(f"[GEMINI] {tok_state.label} quota/rate limit error ({err[:60]}). Rotating to next key...")
+                    self.gemini_model_cache = None
                     retries += 1
                 else:
                     raise
 
-        raise RuntimeError(f"All {len(self.gemini_keys)} Gemini key(s) exhausted")
+        raise RuntimeError(f"All {self.gemini_credentials.total_keys} Gemini key(s) exhausted or on cooldown")
 
     def _rotate_gemini(self):
-        self.gemini_key_index = (self.gemini_key_index + 1) % len(self.gemini_keys)
-        self.gemini_model_cache = None  # reset so model is rediscovered on next key
-        logger.info(f"Gemini → key #{self.gemini_key_index}")
+        # Backwards compatibility helper
+        self.gemini_model_cache = None
 
     def _discover_gemini_model(self) -> str:
         if self.gemini_model_cache:

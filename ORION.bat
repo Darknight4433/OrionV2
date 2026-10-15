@@ -41,7 +41,7 @@ if %ERRORLEVEL% EQU 0 (
 REM ── Start FastAPI backend in background ──
 echo.
 echo [1/2] Starting ORION Backend...
-start /min "ORION Backend" cmd /c "cd backend && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+start /min "ORION Backend" cmd /c "cd backend && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
 timeout /t 4 /nobreak >nul
 echo [OK] Backend running on :8000
 

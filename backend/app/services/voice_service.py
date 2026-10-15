@@ -9,10 +9,10 @@ import pygame
 from typing import Optional, List
 from gtts import gTTS
 import speech_recognition as sr
-from ..services.sarvam_service import SarvamService
-from ..services.eleven_labs_service import ElevenLabsService
-from ..core.config import settings
-from ..core.logging import get_logger
+from app.services.sarvam_service import SarvamService
+from app.services.eleven_labs_service import ElevenLabsService
+from app.core.config import settings
+from app.core.logging import get_logger
 
 logger = get_logger()
 
@@ -171,7 +171,7 @@ class VoiceListenerService:
             try:
                 with sr.Microphone(device_index=settings.MIC_INDEX) as source:
                     # Adjust for background noise quickly
-                    self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    self.recognizer.adjust_for_ambient_noise(source, duration=1)
                     
                     voice_state.is_listening = True
                     logger.debug("Listening...")
@@ -180,7 +180,7 @@ class VoiceListenerService:
                     voice_state.is_listening = False
                     
                     try:
-                        text = self.recognizer.recognize_google(audio)
+                        text = getattr(self.recognizer, "recognize_google")(audio)
                         logger.info(f"Heard: {text}")
                         
                         # Check for wake word if not in active conversation

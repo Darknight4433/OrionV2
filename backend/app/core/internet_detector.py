@@ -22,7 +22,7 @@ Design Principles:
 import re
 from typing import Tuple, Optional, List
 from dataclasses import dataclass
-from .logging import get_logger
+from app.core.logging import get_logger
 
 logger = get_logger()
 

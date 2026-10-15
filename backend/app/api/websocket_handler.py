@@ -38,12 +38,12 @@ Pi 4 → Pi 3 (server sends):
 import asyncio
 import json
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from ..core.intent_router import IntentRouter
-from ..services.greeting_service import GreetingService
-from ..services.memory_service import MemoryService
-from ..core.logging import get_logger
+from app.core.intent_router import IntentRouter
+from app.services.greeting_service import GreetingService
+from app.services.memory_service import MemoryService
+from app.core.logging import get_logger
 
 logger = get_logger()
 
@@ -112,12 +112,14 @@ class SessionHandler:
         intent_router: IntentRouter,
         greeting_service: GreetingService,
         memory_service: MemoryService,
+        movement_service: Optional[Any] = None,
     ):
         self.ws = ws
         self.user_id = user_id
         self.intent_router = intent_router
         self.greeting_service = greeting_service
         self.memory = memory_service
+        self.movement_service = movement_service
 
         self._interrupt = asyncio.Event()
         self._stream_task: Optional[asyncio.Task] = None
@@ -161,6 +163,9 @@ class SessionHandler:
         if msg_type == "chat":
             await self._handle_chat(msg)
 
+        elif msg_type in ("vision", "vision_query"):
+            await self._handle_vision(msg)
+
         elif msg_type == "face":
             await self._handle_face(msg)
 
@@ -179,21 +184,20 @@ class SessionHandler:
             logger.warning(f"[WS] Unknown message type: {msg_type}")
 
     # ──────────────────────────────────────────
-    # CHAT — Main streaming handler
+    # CHAT & VISION — Streaming handlers
     # ──────────────────────────────────────────
 
     async def _handle_chat(self, msg: dict):
-        """Process a chat message. Respects 5s global interaction cooldown."""
+        """Process a chat message with debounce."""
         message = msg.get("message", "").strip()
         user_id = msg.get("user_id", self.user_id)
 
         if not message:
             return
 
-        # OMNIS 5s global interaction cooldown guard
         now = time.time()
-        if (now - self._last_interaction_time) < 5 and self._last_interaction_time > 0:
-            logger.debug(f"[WS] Interaction cooldown active, ignoring: {message[:30]}")
+        if (now - self._last_interaction_time) < 0.5 and self._last_interaction_time > 0:
+            logger.debug(f"[WS] Interaction debounce active, ignoring: {message[:30]}")
             return
         self._last_interaction_time = now
 
@@ -205,21 +209,63 @@ class SessionHandler:
 
         self._interrupt.clear()
 
+        # Check if client sent image along with chat
+        image_b64 = msg.get("image", None)
+        image_bytes = None
+        if image_b64:
+            import base64
+            try:
+                if "," in image_b64:
+                    image_b64 = image_b64.split(",", 1)[1]
+                image_bytes = base64.b64decode(image_b64)
+            except Exception as e:
+                logger.error(f"[WS] Failed to decode image payload: {e}")
+
         self._stream_task = asyncio.create_task(
-            self._stream_response(user_id, message)
+            self._stream_response(user_id, message, image_bytes=image_bytes)
         )
         try:
             await self._stream_task
         except asyncio.CancelledError:
             await self.send({"type": "interrupted"})
 
-    async def _stream_response(self, user_id: str, message: str):
+    async def _handle_vision(self, msg: dict):
+        """Process visual query with optional client-captured image."""
+        user_id = msg.get("user_id", self.user_id)
+        question = msg.get("question", msg.get("message", "What is this object?")).strip()
+        image_b64 = msg.get("image", None)
+        image_bytes = None
+        if image_b64:
+            import base64
+            try:
+                if "," in image_b64:
+                    image_b64 = image_b64.split(",", 1)[1]
+                image_bytes = base64.b64decode(image_b64)
+            except Exception as e:
+                logger.error(f"[WS] Failed to decode image payload: {e}")
+
+        logger.info(f"[WS] Vision query from {user_id}: '{question}' (image provided: {image_bytes is not None})")
+
+        if self._stream_task and not self._stream_task.done():
+            self._stream_task.cancel()
+            await asyncio.sleep(0)
+
+        self._interrupt.clear()
+        self._stream_task = asyncio.create_task(
+            self._stream_response(user_id, question, image_bytes=image_bytes)
+        )
+        try:
+            await self._stream_task
+        except asyncio.CancelledError:
+            await self.send({"type": "interrupted"})
+
+    async def _stream_response(self, user_id: str, message: str, image_bytes: Optional[bytes] = None):
         """Stream AI response tokens to the client."""
         full_response = ""
         ack_sent = False
 
         try:
-            async for chunk in self.intent_router.process_stream(user_id, message):
+            async for chunk in self.intent_router.process_stream(user_id, message, image_bytes=image_bytes):
                 # Check for interrupt
                 if self._interrupt.is_set():
                     await self.send({"type": "interrupted"})
@@ -272,16 +318,18 @@ class SessionHandler:
         self.user_id = detected_user
 
         # ── Movement decision via TinyLlama ──
-        if hasattr(self, 'movement_service') and self.movement_service:
+        if self.movement_service:
             dist_str = f"at {distance}m" if distance else "at unknown distance"
             situation = f"Person '{detected_user}' detected {dist_str}, greeting mode"
-            import asyncio as _asyncio
-            _asyncio.create_task(
-                _asyncio.get_event_loop().run_in_executor(
+            mv = self.movement_service
+            try:
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(
                     None,
-                    lambda: self.movement_service.decide_and_move(situation)
+                    lambda: mv.decide_and_move(situation)
                 )
-            )
+            except RuntimeError:
+                pass
 
         # ── Greeting ──
         greeting = self.greeting_service.get_greeting(detected_user)
@@ -316,6 +364,7 @@ def create_ws_endpoint(
     intent_router: IntentRouter,
     greeting_service: GreetingService,
     memory_service: MemoryService,
+    movement_service: Optional[Any] = None,
 ):
     """
     Factory to create the WebSocket endpoint with injected services.
@@ -349,6 +398,7 @@ def create_ws_endpoint(
             intent_router=intent_router,
             greeting_service=greeting_service,
             memory_service=memory_service,
+            movement_service=movement_service,
         )
         try:
             await handler.handle()

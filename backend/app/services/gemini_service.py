@@ -3,9 +3,9 @@ import re
 import datetime
 import google.generativeai as genai
 from typing import List, Generator, Optional
-from ..core.config import settings
-from ..core.logging import get_logger
-from ..services.memory_service import MemoryService
+from app.core.config import settings
+from app.core.logging import get_logger
+from app.services.memory_service import MemoryService
 
 logger = get_logger()
 
@@ -43,7 +43,7 @@ class GeminiService:
         self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
         self._configure_next_key()
 
-    def _discover_model(self):
+    def _discover_model(self) -> str:
         """Finds the best available model dynamically."""
         if self.cached_model: return self.cached_model
         
@@ -56,8 +56,9 @@ class GeminiService:
             if not found: found = next((m for m in candidates if 'gemini-pro' in m), None)
             if not found and candidates: found = candidates[0]
             
-            self.cached_model = found
-            return found
+            chosen = found or 'gemini-1.5-flash'
+            self.cached_model = chosen
+            return chosen
         except Exception as e:
             print(f"Model discovery failed: {e}")
             return 'gemini-1.5-flash'

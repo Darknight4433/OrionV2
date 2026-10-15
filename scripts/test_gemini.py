@@ -1,57 +1,43 @@
 import sys
 import os
-import asyncio
 
 # Add project root to path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(PROJECT_ROOT)
 
 from backend.app.services.gemini_service import GeminiService
 from backend.app.services.memory_service import MemoryService
 
-async def test_gemini():
-    print("Initializing ORION Intelligence Test...")
+def test_gemini():
+    print("=" * 45)
+    print("   ORION GEMINI INTELLIGENCE TEST")
+    print("=" * 45)
+    
     memory = MemoryService()
     gemini = GeminiService(memory)
     
     if not gemini.api_keys:
-        print("FAIL: No API keys found in .env (or list is empty).")
-        return
+        print("[FAIL] No Gemini API keys found in .env (GEMINI_API_KEYS is empty).")
+        return False
 
-    print(f"Active API Keys found: {len(gemini.api_keys)}")
-    print("Testing response stream...")
-    
-    response_found = False
-    async for chunk in gemini.get_response_stream("test_user", "Hello ORION, are you online?"):
-        print(f"ORION: {chunk}")
-        response_found = True
-        break # Just test connectivity
-    
-    if response_found:
-        print("\nSUCCESS: Gemini Service is communicating.")
-    else:
-        print("\nFAIL: No response received from Gemini.")
-
-if __name__ == "__main__":
-    # GeminiService.get_response_stream is synchronous generator in current implementation
-    # but the intent engine treats it as one. 
-    # Let's check the service definition again.
-    # Ah, it's a sync generator: def get_response_stream(...) -> Generator[str, None, None]
-    
-    print("Initializing ORION Intelligence Test...")
-    memory = MemoryService()
-    gemini = GeminiService(memory)
-    
-    if not gemini.api_keys:
-        print("FAIL: No API keys found in .env (or list is empty).")
-        sys.exit(1)
-
-    print(f"Active API Keys found: {len(gemini.api_keys)}")
-    print("Testing response stream...")
+    print(f"[OK] Active API Keys found: {len(gemini.api_keys)}")
+    print("Testing response stream with prompt: 'Hello ORION, are you online?'...\n")
     
     try:
+        response_chunks = []
         for chunk in gemini.get_response_stream("test_user", "Hello ORION, are you online?"):
-            print(f"ORION: {chunk}")
-            break
-        print("\nSUCCESS: Gemini Service is communicating.")
+            response_chunks.append(chunk)
+            print(chunk, end="", flush=True)
+            if len(response_chunks) >= 3:
+                # Successfully received response stream
+                break
+        
+        print("\n\n[SUCCESS] Gemini Service is communicating properly.")
+        return True
     except Exception as e:
-        print(f"\nFAIL: Error during communication: {e}")
+        print(f"\n[FAIL] Error during communication: {e}")
+        return False
+
+if __name__ == "__main__":
+    success = test_gemini()
+    sys.exit(0 if success else 1)

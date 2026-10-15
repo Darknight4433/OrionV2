@@ -2,8 +2,8 @@ import asyncio
 import sys
 import os
 
-# Adjust path to import backend modules
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(PROJECT_ROOT)
 
 from backend.app.services.browser_service import BrowserService
 from backend.app.services.memory_service import MemoryService
@@ -12,7 +12,7 @@ async def ingest(url: str):
     print(f"Starting ingestion for: {url}")
     
     browser = BrowserService()
-    memory = MemoryService() # Defaults to backend/data/orion.db if running from root, might need adjustment
+    memory = MemoryService()  # Correctly defaults to data/orion.db in PROJECT_ROOT
     
     try:
         content = await browser.scrape_page(url)

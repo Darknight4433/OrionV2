@@ -2,7 +2,7 @@ import asyncio
 from playwright.async_api import async_playwright, TimeoutError
 from typing import Optional
 import re
-from ..core.logging import get_logger
+from app.core.logging import get_logger
 
 logger = get_logger()
 
@@ -41,6 +41,8 @@ class BrowserService:
 
         async with self.semaphore:
             await self._ensure_browser()
+            if not self.browser:
+                return "Error: Browser not available"
             page = await self.browser.new_page()
             try:
                 # 15s Timeout - Aggressive for production
@@ -68,6 +70,8 @@ class BrowserService:
         
         async with self.semaphore:
             await self._ensure_browser()
+            if not self.browser:
+                return ["Error: Browser not available"]
             page = await self.browser.new_page()
             results = []
             try:

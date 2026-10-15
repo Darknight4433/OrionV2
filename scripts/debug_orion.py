@@ -8,7 +8,8 @@ from colorama import init, Fore, Style
 init()
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOG_FILE = os.path.join(PROJECT_ROOT, "logs", "orion_errors.log")
+LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
+LOG_FILE = os.path.join(LOGS_DIR, "orion_errors.log")
 
 # Error Signatures & Explanations
 ERROR_MAP = {
@@ -31,10 +32,17 @@ def monitor_errors():
     print(f"Project Target: {PROJECT_ROOT}")
     print(f"Monitoring: {LOG_FILE}\n")
 
+    # Ensure logs directory exists
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
     if not os.path.exists(LOG_FILE):
-        print(f"{Fore.YELLOW}[WARN]{Fore.RESET} Waiting for log file to be created...")
-        while not os.path.exists(LOG_FILE):
-            time.sleep(2)
+        print(f"{Fore.YELLOW}[WARN]{Fore.RESET} Log file not found at {LOG_FILE}.")
+        print(f"{Fore.YELLOW}[INFO]{Fore.RESET} Initializing log file and waiting for ORION activity...")
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"# ORION Log initialized at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        except Exception as e:
+            print(f"{Fore.RED}[ERROR] Could not initialize log file: {e}{Fore.RESET}")
 
     try:
         with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
@@ -57,9 +65,22 @@ def monitor_errors():
                         found_match = True
                         break
                 
-                # Visual output
-                timestamp = line.split("|")[0].strip() if "|" in line else "LIVE"
-                message = line.split("-")[-1].strip() if "-" in line else line.strip()
+                # Visual output - robust parsing for timestamps and messages
+                stripped_line = line.strip()
+                if not stripped_line:
+                    continue
+
+                if "|" in stripped_line:
+                    parts = [p.strip() for p in stripped_line.split("|")]
+                    timestamp = parts[0]
+                    message = " | ".join(parts[1:])
+                elif " - " in stripped_line:
+                    parts = stripped_line.split(" - ", 1)
+                    timestamp = parts[0].strip()
+                    message = parts[1].strip()
+                else:
+                    timestamp = "LIVE"
+                    message = stripped_line
                 
                 if found_match:
                     print(f"{Fore.RED}{Style.BRIGHT}[CRITICAL]{Style.RESET_ALL} {Fore.WHITE}{timestamp}{Fore.RESET}")

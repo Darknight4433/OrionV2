@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -30,6 +30,11 @@ from app.core.intent_router import IntentRouter
 from app.services.memory_service import MemoryService
 from app.services.browser_service import BrowserService
 from app.services.greeting_service import GreetingService
+from app.services.camera_manager import CameraManager
+from app.services.vision_manager import VisionManager
+from app.services.ocr_service import OCRService
+
+from app.services.movement_service import MovementService
 
 # API Routers
 from app.api import monitoring
@@ -75,14 +80,20 @@ async def safe_mode_middleware(request: Request, call_next):
 # SERVICE INITIALIZATION
 # ──────────────────────────────────────────
 
-memory_service  = MemoryService()
-browser_service = BrowserService()
+memory_service   = MemoryService()
+browser_service  = BrowserService()
 greeting_service = GreetingService(memory_service)
-ai_manager      = AIManager()
-intent_router   = IntentRouter(
+movement_service = MovementService()
+ai_manager       = AIManager()
+camera_manager   = CameraManager()
+vision_manager   = VisionManager(camera_manager)
+ocr_service      = OCRService()
+intent_router    = IntentRouter(
     ai_manager=ai_manager,
     memory_service=memory_service,
     browser_service=browser_service,
+    vision_manager=vision_manager,
+    ocr_service=ocr_service,
 )
 
 scheduler = AsyncIOScheduler()
@@ -94,7 +105,7 @@ scheduler = AsyncIOScheduler()
 app.include_router(monitoring.router)
 
 # WebSocket endpoint — primary Pi 3 ↔ Pi 4 channel
-ws_router = create_ws_endpoint(intent_router, greeting_service, memory_service)
+ws_router = create_ws_endpoint(intent_router, greeting_service, memory_service, movement_service)
 app.include_router(ws_router)
 
 # ──────────────────────────────────────────
@@ -237,11 +248,55 @@ async def update_mood(mood: str):
     return {"status": f"Mood updated: {mood}"}
 
 
+class VisionRequest(BaseModel):
+    user_id: str = "default_user"
+    question: str = "What is this object?"
+    image_base64: Optional[str] = None
+
+class VisionResponse(BaseModel):
+    response: str
+    provider: str
+    latency_seconds: float
+    success: bool
+
+
+@app.post("/vision", response_model=VisionResponse)
+async def vision_endpoint(request: VisionRequest):
+    """Direct HTTP visual query endpoint for testing or client upload."""
+    import base64
+    image_bytes = None
+    if request.image_base64:
+        b64 = request.image_base64.split(",", 1)[1] if "," in request.image_base64 else request.image_base64
+        try:
+            image_bytes = base64.b64decode(b64)
+        except Exception:
+            pass
+
+    result = await vision_manager.process_visual_query(
+        user_id=request.user_id,
+        question=request.question,
+        image_bytes=image_bytes
+    )
+    return VisionResponse(
+        response=result.text_response,
+        provider=result.provider_used,
+        latency_seconds=result.latency_seconds,
+        success=result.success
+    )
+
+
 @app.get("/ai/status")
 async def ai_status():
     return {
         "providers": ai_manager.get_health_status(),
+        "vision": {
+            "model": settings.HF_VISION_MODEL,
+            "hf_credentials": vision_manager.hf_credentials.get_status(),
+            "gemini_fallback": vision_manager.gemini_credentials.get_status(),
+            "camera_state": vision_manager.camera.state.value,
+        },
         "persona": intent_router.current_persona,
         "mood": intent_router.current_mood,
         "ws_connections": len(ws_manager.active),
     }
+

@@ -19,10 +19,14 @@ Serial Protocol (ESP32 expects):
 
 import re
 import time
+from typing import Optional
 import requests
-import serial
-import serial.tools.list_ports
-from ..core.logging import get_logger
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    serial = None
+from app.core.logging import get_logger
 
 logger = get_logger()
 
@@ -61,15 +65,15 @@ Command (one word only):"""
 
 class MovementService:
 
-    def __init__(self, serial_port: str = None, baud_rate: int = 9600):
+    def __init__(self, serial_port: Optional[str] = None, baud_rate: int = 9600):
         self.serial_conn = None
         self._last_command = "S"
-        self._last_command_time = 0
+        self._last_command_time = 0.0
         self.MIN_COMMAND_INTERVAL = 0.5  # seconds between commands
 
         # Auto-detect ESP32 serial port
         port = serial_port or self._auto_detect_port()
-        if port:
+        if port and serial:
             try:
                 self.serial_conn = serial.Serial(port, baud_rate, timeout=1)
                 time.sleep(2)  # ESP32 reset delay
@@ -79,8 +83,10 @@ class MovementService:
         else:
             logger.warning("[MOVE] No ESP32 found — movement disabled (simulation mode)")
 
-    def _auto_detect_port(self) -> str:
+    def _auto_detect_port(self) -> Optional[str]:
         """Find ESP32/Arduino on serial ports."""
+        if not serial:
+            return None
         ports = serial.tools.list_ports.comports()
         for p in ports:
             desc = (p.description or "").lower()
@@ -144,7 +150,7 @@ class MovementService:
     # TINYLLAMA DECISION
     # ──────────────────────────────────────────
 
-    def _ask_tinyllama(self, situation: str) -> str:
+    def _ask_tinyllama(self, situation: str) -> Optional[str]:
         """Ask TinyLlama for a movement decision. Returns command string or None."""
         try:
             prompt = MOVEMENT_PROMPT.format(situation=situation)
@@ -197,7 +203,7 @@ class MovementService:
         "GREET":    0,
     }
 
-    def _execute(self, command: str, speed: int = None):
+    def _execute(self, command: str, speed: Optional[int] = None):
         if speed is None:
             speed = self.SPEED_MAP.get(command, 0)
 

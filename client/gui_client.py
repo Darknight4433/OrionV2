@@ -11,6 +11,7 @@ Solidified client with:
 import sys, os, cv2, time, threading, requests, queue, psutil, pickle, json
 import numpy as np, face_recognition, pyttsx3, speech_recognition as sr
 import pygame, tempfile, re, base64
+from typing import Optional, Dict, Any, List
 
 from datetime import datetime
 from dotenv import load_dotenv
@@ -254,13 +255,16 @@ class OrionWebSocketThread(QThread):
 
     # ── Public send API ──
 
-    def send_chat(self, message: str):
-        """Queue a chat message to be sent to Pi 4."""
-        self._send_queue.put({
+    def send_chat(self, message: str, image: Optional[str] = None):
+        """Queue a chat message (with optional visual frame) to be sent to Pi 4."""
+        payload = {
             "type": "chat",
             "user_id": self.user_id,
             "message": message
-        })
+        }
+        if image:
+            payload["image"] = image
+        self._send_queue.put(payload)
 
     def send_face(self, detected_user: str):
         """Notify Pi 4 that a face was detected."""
@@ -993,18 +997,54 @@ class OrionDashboard(QMainWindow):
             self.input_field.clear()
             self._on_voice_input(text)
 
+    def _is_visual_query(self, text: str) -> bool:
+        """Checks if utterance is a visual reasoning request (Section 4)."""
+        t = text.lower().strip()
+        patterns = [
+            r"\bwhat (?:is|are) (?:this|that|these|those)\b",
+            r"\bwhat am i holding\b",
+            r"\bidentify (?:this|that|the object)\b",
+            r"\bwhat (?:object|item) is this\b",
+            r"\bread this\b",
+            r"\bwhat does this say\b",
+            r"\bhow many objects\b",
+            r"\bwhat do you see\b",
+            r"\blook at (?:this|that)\b",
+        ]
+        return any(re.search(p, t) for p in patterns)
+
     def _on_voice_input(self, text):
-        if self.status == "SPEAKING":
-            # Interrupt current stream — user has something new to say
+        if self.status == "SPEAKING" or (pygame.mixer.get_init() and pygame.mixer.music.get_busy()):
+            # Immediate TTS interruption (Specification Section 16)
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+            if hasattr(self, 'speaker') and self.speaker:
+                # Flush pending speech queue
+                self.speaker.queue = queue.PriorityQueue()
             self.ws.send_interrupt()
-            time.sleep(0.1)
+            time.sleep(0.05)
 
         self._log("YOU", text, "#38BDF8")
         self._on_status("THINKING")
 
-        # Send via persistent WebSocket — no new thread per message
+        # Capture single frame if visual query
+        img_b64 = None
+        if self._is_visual_query(text) and hasattr(self, 'cap') and self.cap and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                try:
+                    success, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    if success:
+                        img_b64 = base64.b64encode(buf).decode('utf-8')
+                        print(f"[VISION] Captured frame for visual query '{text}'")
+                except Exception as e:
+                    print(f"[VISION FRAME ERR] {e}")
+
+        # Send via persistent WebSocket with user identity
         self.ws.update_user(self.current_user)
-        self.ws.send_chat(text)
+        self.ws.send_chat(text, image=img_b64)
 
     def _on_token_received(self, token):
         """Accumulate streaming tokens — speak when we have a full sentence."""

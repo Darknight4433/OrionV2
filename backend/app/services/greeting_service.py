@@ -19,8 +19,8 @@ import time
 import random
 import datetime
 from typing import Dict, Optional
-from .memory_service import MemoryService
-from ..core.logging import get_logger
+from app.services.memory_service import MemoryService
+from app.core.logging import get_logger
 
 logger = get_logger()
 

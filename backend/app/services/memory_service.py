@@ -1,21 +1,23 @@
 import sqlite3
 import time
 import os
-from ..core.config import settings, PROJECT_ROOT
-from ..core.logging import get_logger
+from typing import Optional
+from app.core.config import settings, PROJECT_ROOT
+from app.core.logging import get_logger
 
 logger = get_logger()
 
 class MemoryService:
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or os.path.join(PROJECT_ROOT, "data", "orion.db")
         self._init_db()
 
     def _init_db(self):
         """Initialize tables with WAL mode for SD card durability."""
         try:
-            if not os.path.exists(os.path.dirname(self.db_path)):
-                os.makedirs(os.path.dirname(self.db_path))
+            dir_name = os.path.dirname(self.db_path)
+            if dir_name and not os.path.exists(dir_name):
+                os.makedirs(dir_name)
                 
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("PRAGMA journal_mode=WAL;")

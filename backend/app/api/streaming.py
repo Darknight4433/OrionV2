@@ -33,8 +33,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 
-from ..core.intent_router import IntentRouter
-from ..core.logging import get_logger
+from app.core.intent_router import IntentRouter
+from app.core.logging import get_logger
 
 logger = get_logger()
 
